@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 import dataclasses
+import tempfile
 
 import pytest
 
+from rfsn_agent.cas import ContentAddressedStore
 from rfsn_agent.common import canonical_json, hash_content
 from rfsn_agent.domain import (
     BudgetLedger,
     CandidateItem,
     Claim,
+    ContentReference,
     CuratedItem,
     EvidenceLink,
     HarnessSnapshot,
@@ -261,3 +264,72 @@ def test_provenance_with_event() -> None:
     stamped = prov.with_event("evt-1")
     assert stamped.event_id == "evt-1"
     assert prov.event_id is None
+
+
+def test_content_reference_creation() -> None:
+    ref = ContentReference(content_hash="a" * 64, byte_length=100)
+    assert ref.content_hash == "a" * 64
+    assert ref.byte_length == 100
+
+
+def test_candidate_item_cas_resolution() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        cas = ContentAddressedStore(tmp)
+        item = CandidateItem.create_with_cas(
+            item_id="cand-1",
+            trajectory_id="traj-1",
+            source_id="src-1",
+            retrieval_query="q",
+            content="large content " * 1000,
+            cas=cas,
+        )
+        assert item.content == ""
+        assert item.content_ref is not None
+        resolved = item.resolve_content(cas)
+        assert resolved == "large content " * 1000
+
+
+def test_tool_result_cas_resolution() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        cas = ContentAddressedStore(tmp)
+        result = ToolResult.create_with_cas(
+            result_id="res-1",
+            invocation_id="tool-1",
+            trajectory_id="traj-1",
+            status=ToolStatus.SUCCESS,
+            content="tool output " * 1000,
+            cas=cas,
+        )
+        assert result.content == ""
+        assert result.content_ref is not None
+        resolved = result.resolve_content(cas)
+        assert resolved == "tool output " * 1000
+
+
+def test_submission_record_cas_resolution() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        cas = ContentAddressedStore(tmp)
+        sub = SubmissionRecord.create_with_cas(
+            submission_id="sub-1",
+            trajectory_id="traj-1",
+            content="final answer " * 1000,
+            source_ids=("src-1",),
+            cas=cas,
+        )
+        assert sub.content == ""
+        assert sub.content_ref is not None
+        resolved = sub.resolve_content(cas)
+        assert resolved == "final answer " * 1000
+
+
+def test_candidate_item_without_content_ref() -> None:
+    item = CandidateItem.create(
+        item_id="cand-1",
+        trajectory_id="traj-1",
+        source_id="src-1",
+        retrieval_query="q",
+        content="hello",
+    )
+    assert item.content == "hello"
+    assert item.content_ref is None
+    assert item.content_hash == hash_content("hello")

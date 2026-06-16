@@ -13,6 +13,7 @@ from rfsn_agent.actions import (
 )
 from rfsn_agent.context import CompilerConfig, ContextPacket, TokenCounter, compile_context
 from rfsn_agent.domain import HarnessSnapshot
+from rfsn_agent.security import SecurityProfile
 from rfsn_agent.store import SQLiteEventStore, StaleContextError
 from rfsn_agent.types import TrajectoryId
 
@@ -38,10 +39,12 @@ class Runtime:
         store: SQLiteEventStore,
         compiler_config: CompilerConfig,
         token_counter: TokenCounter | None = None,
+        security_profile: SecurityProfile | None = None,
     ) -> None:
         self.store = store
         self.compiler_config = compiler_config
         self.token_counter = token_counter
+        self.security_profile = security_profile
 
     def execute(
         self,
@@ -54,7 +57,21 @@ class Runtime:
     ) -> HarnessSnapshot:
         """Validate and execute one action, returning the new snapshot."""
         snapshot = self.store.get_latest_snapshot(trajectory_id)
-        validate_action(action, snapshot, token_cost_estimate=token_cost_estimate)
+        validate_action(
+            action,
+            snapshot,
+            token_cost_estimate=token_cost_estimate,
+            allowed_tool_names=(
+                self.security_profile.allowed_tool_names
+                if self.security_profile is not None
+                else None
+            ),
+            forbidden_path_pattern=(
+                self.security_profile.forbidden_path_pattern
+                if self.security_profile is not None
+                else None
+            ),
+        )
         proposed = plan_events(action, snapshot, action_id=action_id, actor=actor)
         self.store.commit_events(
             trajectory_id=TrajectoryId(trajectory_id),
@@ -87,7 +104,21 @@ class Runtime:
             if action_id is None:
                 action_id = f"step-{uuid.uuid4().hex}"
             try:
-                validate_action(action, snapshot, token_cost_estimate=token_cost_estimate)
+                validate_action(
+                    action,
+                    snapshot,
+                    token_cost_estimate=token_cost_estimate,
+                    allowed_tool_names=(
+                        self.security_profile.allowed_tool_names
+                        if self.security_profile is not None
+                        else None
+                    ),
+                    forbidden_path_pattern=(
+                        self.security_profile.forbidden_path_pattern
+                        if self.security_profile is not None
+                        else None
+                    ),
+                )
                 proposed = plan_events(action, snapshot, action_id=action_id, actor="policy")
                 self.store.commit_events(
                     trajectory_id=TrajectoryId(trajectory_id),
@@ -109,8 +140,14 @@ class Runtime:
         *,
         max_steps: int = 10,
         stop_on: tuple[type[Exception], ...] = (ActionError,),
+        stop_on_submit: bool = True,
     ) -> HarnessSnapshot:
-        """Run the policy loop for up to ``max_steps`` iterations."""
+        """Run the policy loop for up to ``max_steps`` iterations.
+
+        If ``stop_on_submit`` is True (the default), the loop terminates
+        cleanly as soon as the policy emits a :class:`SubmitAction`,
+        signalling that the agent considers the task complete.
+        """
         run_id = uuid.uuid4().hex
         snapshot = self.store.get_latest_snapshot(trajectory_id)
         for step_idx in range(max_steps):
@@ -122,4 +159,10 @@ class Runtime:
                 )
             except stop_on:
                 break
+            # Terminal-state: a SubmitAction means the agent is done.
+            if stop_on_submit and snapshot.submissions:
+                latest_submission = snapshot.submissions[-1]
+                # Only break if this submission was produced by the current run.
+                if latest_submission.provenance.action_id.startswith(f"run-{run_id}"):
+                    break
         return snapshot

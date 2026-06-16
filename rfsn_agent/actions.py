@@ -8,9 +8,12 @@ from dataclasses import dataclass
 from rfsn_agent.domain import HarnessSnapshot
 from rfsn_agent.events import (
     ActionCommittedPayload,
+    CandidateAddedPayload,
+    ClaimCreatedPayload,
     ClaimRevisedPayload,
     ContextPrunedPayload,
     EvidenceCuratedPayload,
+    EvidenceLinkedPayload,
     EvidenceVerifiedPayload,
     ProposedEvent,
     SubmissionRecordedPayload,
@@ -120,6 +123,29 @@ class SubmitAction:
     source_ids: tuple[str, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class AddCandidateAction:
+    item_id: str
+    source_id: str
+    retrieval_query: str
+    content: str
+
+
+@dataclass(frozen=True, slots=True)
+class CreateClaimAction:
+    claim_id: str
+    content: str
+
+
+@dataclass(frozen=True, slots=True)
+class LinkEvidenceAction:
+    link_id: str
+    claim_id: str
+    curated_item_id: str
+    relationship: str
+    strength: float
+
+
 Action = (
     DecomposeAction
     | SearchAction
@@ -131,6 +157,9 @@ Action = (
     | PruneSemanticAction
     | RequestContextAction
     | SubmitAction
+    | AddCandidateAction
+    | CreateClaimAction
+    | LinkEvidenceAction
 )
 
 
@@ -143,7 +172,7 @@ def validate_action(
     action: Action,
     snapshot: HarnessSnapshot,
     *,
-    allowed_tool_names: set[str] | None = None,
+    allowed_tool_names: set[str] | frozenset[str] | None = None,
     forbidden_path_pattern: re.Pattern[str] | None = None,
     token_cost_estimate: int = 0,
 ) -> None:
@@ -190,7 +219,7 @@ def _validate_preconditions(
     action: Action,
     snapshot: HarnessSnapshot,
     *,
-    allowed_tool_names: set[str] | None = None,
+    allowed_tool_names: set[str] | frozenset[str] | None = None,
 ) -> None:
     if isinstance(action, DecomposeAction):
         existing_tasks = {t.task_id for t in snapshot.tasks}
@@ -248,6 +277,34 @@ def _validate_preconditions(
     elif isinstance(action, SubmitAction):
         if not action.content or not action.content.strip():
             raise PreconditionError("Submission content must be non-empty")
+
+    elif isinstance(action, AddCandidateAction):
+        existing_candidates = {c.item_id for c in snapshot.candidates}
+        if action.item_id in existing_candidates:
+            raise PreconditionError(f"Candidate already exists: {action.item_id}")
+
+    elif isinstance(action, CreateClaimAction):
+        existing_claims = {c.claim_id for c in snapshot.claims}
+        if action.claim_id in existing_claims:
+            raise PreconditionError(f"Claim already exists: {action.claim_id}")
+
+    elif isinstance(action, LinkEvidenceAction):
+        existing_claims = {c.claim_id for c in snapshot.claims}
+        if action.claim_id not in existing_claims:
+            raise PreconditionError(f"Claim does not exist: {action.claim_id}")
+        existing_curated = {c.item_id for c in snapshot.curated_items}
+        if action.curated_item_id not in existing_curated:
+            raise PreconditionError(
+                f"Curated item does not exist: {action.curated_item_id}"
+            )
+        if action.relationship not in {"supports", "contradicts", "neutral"}:
+            raise PreconditionError(
+                f"Invalid relationship: {action.relationship}"
+            )
+        if not 0.0 <= action.strength <= 1.0:
+            raise PreconditionError(
+                f"Strength must be in [0.0, 1.0], got {action.strength}"
+            )
 
     elif isinstance(action, SearchAction | ReadAction):
         if allowed_tool_names is not None:
@@ -436,6 +493,56 @@ def plan_events(
                     source_ids=action.source_ids,
                 ),
                 idempotency_key=f"{action_id}-submit",
+                actor=actor,
+                action_id=action_id,
+            )
+        )
+
+    elif isinstance(action, AddCandidateAction):
+        events.append(
+            ProposedEvent(
+                event_type="candidate_added",
+                payload=CandidateAddedPayload(
+                    item_id=ItemId(action.item_id),
+                    trajectory_id=snapshot.trajectory_id,
+                    source_id=action.source_id,
+                    retrieval_query=action.retrieval_query,
+                    content=action.content,
+                ),
+                idempotency_key=f"{action_id}-add-candidate",
+                actor=actor,
+                action_id=action_id,
+            )
+        )
+
+    elif isinstance(action, CreateClaimAction):
+        events.append(
+            ProposedEvent(
+                event_type="claim_created",
+                payload=ClaimCreatedPayload(
+                    claim_id=ClaimId(action.claim_id),
+                    trajectory_id=snapshot.trajectory_id,
+                    content=action.content,
+                ),
+                idempotency_key=f"{action_id}-create-claim",
+                actor=actor,
+                action_id=action_id,
+            )
+        )
+
+    elif isinstance(action, LinkEvidenceAction):
+        events.append(
+            ProposedEvent(
+                event_type="evidence_linked",
+                payload=EvidenceLinkedPayload(
+                    link_id=LinkId(action.link_id),
+                    trajectory_id=snapshot.trajectory_id,
+                    claim_id=ClaimId(action.claim_id),
+                    curated_item_id=ItemId(action.curated_item_id),
+                    relationship=action.relationship,
+                    strength=action.strength,
+                ),
+                idempotency_key=f"{action_id}-link-evidence",
                 actor=actor,
                 action_id=action_id,
             )

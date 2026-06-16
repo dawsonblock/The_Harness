@@ -4,9 +4,14 @@ from __future__ import annotations
 
 import pytest
 
+from rfsn_agent.common import hash_content
 from rfsn_agent.context import (
     CompilerConfig,
+    ContextPacket,
     ContextSegment,
+    DefaultContextSelector,
+    JinjaContextRenderer,
+    TrustedRole,
     WhitespaceTokenCounter,
     compile_context,
     compute_epoch,
@@ -21,7 +26,7 @@ from rfsn_agent.domain import (
     TaskNode,
     ToolResult,
 )
-from rfsn_agent.types import ClaimStatus, TaskStatus
+from rfsn_agent.types import ClaimStatus, TaskStatus, ToolStatus
 
 
 def _snapshot(
@@ -382,3 +387,213 @@ def test_no_prefix_reuse_when_first_segment_changes() -> None:
     epoch = compute_epoch(packet1, packet2, cache_branch_id="branch-1")
     assert epoch.common_prefix_tokens == 0
     assert epoch.invalidated_suffix_tokens == packet2.total_tokens
+
+
+def test_default_context_selector_matches_old_collect_segments() -> None:
+    """DefaultContextSelector should replicate the old _collect_segments + allocation logic."""
+    counter = WhitespaceTokenCounter()
+    snap = _snapshot(
+        tasks=(
+            TaskNode(
+                task_id="task-1",
+                trajectory_id="traj-1",
+                parent_id=None,
+                description="find the bug",
+                status=TaskStatus.IN_PROGRESS,
+            ),
+        ),
+        budget=BudgetLedger(trajectory_id="traj-1", max_tokens=1000),
+        tool_results=(
+            ToolResult(
+                result_id="res-1",
+                trajectory_id="traj-1",
+                invocation_id="inv-1",
+                status=ToolStatus.SUCCESS,
+                content="tool output",
+                content_hash=hash_content("tool output"),
+            ),
+        ),
+    )
+    config = CompilerConfig(max_total_tokens=100)
+
+    # The old inline logic is now encapsulated in DefaultContextSelector.
+    selector = DefaultContextSelector()
+    selected = selector.select(snap, config, counter)
+
+    # compile_context without renderer should produce the same segments.
+    packet = compile_context(snap, config, counter)
+
+    assert [s.segment_id for s in selected] == [s.segment_id for s in packet.segments]
+    assert sum(s.token_count for s in selected) == packet.total_tokens
+
+
+def test_jinja_context_renderer_llama3() -> None:
+    segments = [
+        ContextSegment.create(
+            segment_id="s1", kind="plan", priority=1, content="hello", role=TrustedRole.SYSTEM
+        ),
+        ContextSegment.create(
+            segment_id="s2", kind="tool_results", priority=1, content="world", role=TrustedRole.TOOL
+        ),
+    ]
+    renderer = JinjaContextRenderer()
+    output = renderer.render(segments, "llama3")
+    assert "<|begin_of_text|>" in output
+    assert '<segment kind="plan">' in output
+    assert '<segment kind="tool_results">' in output
+    assert "<|end_of_text|>" in output
+
+
+def test_jinja_context_renderer_gpt4() -> None:
+    segments = [
+        ContextSegment.create(
+            segment_id="s1", kind="plan", priority=1, content="hello", role=TrustedRole.SYSTEM
+        ),
+    ]
+    renderer = JinjaContextRenderer()
+    output = renderer.render(segments, "gpt4")
+    assert "### plan" in output
+    assert "hello" in output
+
+
+def test_jinja_context_renderer_claude() -> None:
+    segments = [
+        ContextSegment.create(
+            segment_id="s1", kind="plan", priority=1, content="hello", role=TrustedRole.SYSTEM
+        ),
+    ]
+    renderer = JinjaContextRenderer()
+    output = renderer.render(segments, "claude")
+    assert "[plan]" in output
+    assert "hello" in output
+
+
+def test_role_based_segment_grouping_in_compile_context() -> None:
+    counter = WhitespaceTokenCounter()
+    snap = _snapshot(
+        tasks=(
+            TaskNode(
+                task_id="task-1",
+                trajectory_id="traj-1",
+                parent_id=None,
+                description="find the bug",
+                status=TaskStatus.IN_PROGRESS,
+            ),
+        ),
+        tool_results=(
+            ToolResult(
+                result_id="res-1",
+                trajectory_id="traj-1",
+                invocation_id="inv-1",
+                status=ToolStatus.SUCCESS,
+                content="tool output",
+                content_hash=hash_content("tool output"),
+            ),
+        ),
+    )
+    config = CompilerConfig(max_total_tokens=100)
+    renderer = JinjaContextRenderer()
+    packet = compile_context(snap, config, counter, renderer=renderer, model_type="llama3")
+
+    # With a renderer the packet should contain a single rendered segment.
+    assert len(packet.segments) == 1
+    rendered = packet.segments[0]
+    assert rendered.kind == "rendered"
+    # Boundary marker should appear between SYSTEM (task/plan) and TOOL (tool results).
+    assert "<|tool|>" in rendered.content
+
+
+def test_compute_epoch_with_token_ids() -> None:
+    seg = ContextSegment.create(
+        segment_id="s1", kind="plan", priority=1, content="hello"
+    )
+    packet1 = ContextPacket.create(
+        trajectory_id="traj-1",
+        epoch_id="epoch-0",
+        state_sequence=0,
+        segments=(seg,),
+        total_tokens=10,
+        source_hashes=(seg.content_hash,),
+        token_ids=(1, 2, 3, 4, 5),
+    )
+    packet2 = ContextPacket.create(
+        trajectory_id="traj-1",
+        epoch_id="epoch-1",
+        state_sequence=1,
+        segments=(seg,),
+        total_tokens=10,
+        source_hashes=(seg.content_hash,),
+        token_ids=(1, 2, 3, 6, 7),
+    )
+    epoch = compute_epoch(
+        packet1,
+        packet2,
+        cache_branch_id="branch-1",
+        previous_token_ids=packet1.token_ids,
+        current_token_ids=packet2.token_ids,
+    )
+    # First 3 tokens are identical.
+    assert epoch.common_prefix_tokens == 3
+    assert epoch.invalidated_suffix_tokens == 2
+    assert epoch.parent_epoch_id == "epoch-0"
+    assert epoch.epoch_id == "epoch-1"
+
+
+def test_compute_epoch_with_token_ids_no_reuse() -> None:
+    seg1 = ContextSegment.create(
+        segment_id="s1", kind="plan", priority=1, content="hello"
+    )
+    seg2 = ContextSegment.create(
+        segment_id="s2", kind="plan", priority=1, content="world"
+    )
+    packet1 = ContextPacket.create(
+        trajectory_id="traj-1",
+        epoch_id="epoch-0",
+        state_sequence=0,
+        segments=(seg1,),
+        total_tokens=10,
+        source_hashes=(seg1.content_hash,),
+        token_ids=(1, 2, 3),
+    )
+    packet2 = ContextPacket.create(
+        trajectory_id="traj-1",
+        epoch_id="epoch-1",
+        state_sequence=1,
+        segments=(seg2,),
+        total_tokens=10,
+        source_hashes=(seg2.content_hash,),
+        token_ids=(4, 5, 6),
+    )
+    epoch = compute_epoch(
+        packet1,
+        packet2,
+        cache_branch_id="branch-1",
+        previous_token_ids=packet1.token_ids,
+        current_token_ids=packet2.token_ids,
+    )
+    assert epoch.common_prefix_tokens == 0
+    assert epoch.invalidated_suffix_tokens == 3
+
+
+def test_compile_context_backward_compatible_without_renderer() -> None:
+    """Without a renderer, compile_context must behave exactly as before."""
+    counter = WhitespaceTokenCounter()
+    snap = _snapshot(
+        tasks=(
+            TaskNode(
+                task_id="task-1",
+                trajectory_id="traj-1",
+                parent_id=None,
+                description="find the bug",
+                status=TaskStatus.IN_PROGRESS,
+            ),
+        ),
+        budget=BudgetLedger(trajectory_id="traj-1", max_tokens=1000),
+    )
+    config = CompilerConfig(max_total_tokens=100)
+    packet = compile_context(snap, config, counter)
+    kinds = {s.kind for s in packet.segments}
+    assert "task_constraints" in kinds
+    assert "plan" in kinds
+    # No rendered segment should appear.
+    assert "rendered" not in kinds

@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
+from rfsn_agent.cas import ContentAddressedStore
 from rfsn_agent.common import (
     canonical_json,
     dataclass_from_dict,
@@ -56,6 +57,14 @@ _DEFAULT_PROVENANCE = Provenance(actor="system", action_id="init")
 
 
 @dataclass(frozen=True, slots=True)
+class ContentReference:
+    """A pointer to content stored in an external content-addressed store."""
+
+    content_hash: ContentHash
+    byte_length: int
+
+
+@dataclass(frozen=True, slots=True)
 class CandidateItem:
     """A raw item retrieved from an external source, before curation."""
 
@@ -68,14 +77,21 @@ class CandidateItem:
     metadata: tuple[tuple[str, str], ...] = field(default_factory=tuple)
     created_at: datetime = field(default_factory=utc_now)
     provenance: Provenance = field(default_factory=lambda: _DEFAULT_PROVENANCE)
+    content_ref: ContentReference | None = None
 
     def __post_init__(self) -> None:
-        expected = hash_content(self.content)
-        if expected != self.content_hash:
-            raise ValueError(
-                f"CandidateItem {self.item_id}: content_hash mismatch: "
-                f"expected {expected}, got {self.content_hash}"
-            )
+        if self.content_ref is None:
+            expected = hash_content(self.content)
+            if expected != self.content_hash:
+                raise ValueError(
+                    f"CandidateItem {self.item_id}: content_hash mismatch: "
+                    f"expected {expected}, got {self.content_hash}"
+                )
+
+    def resolve_content(self, store: ContentAddressedStore) -> str:
+        if self.content_ref is not None:
+            return store.get_text(self.content_ref.content_hash)
+        return self.content
 
     @classmethod
     def create(
@@ -98,6 +114,36 @@ class CandidateItem:
             content_hash=hash_content(content),
             metadata=metadata or (),
             provenance=provenance or _DEFAULT_PROVENANCE,
+        )
+
+    @classmethod
+    def create_with_cas(
+        cls,
+        *,
+        item_id: ItemId,
+        trajectory_id: TrajectoryId,
+        source_id: str,
+        retrieval_query: str,
+        content: str,
+        metadata: tuple[tuple[str, str], ...] | None = None,
+        provenance: Provenance | None = None,
+        cas: ContentAddressedStore,
+    ) -> CandidateItem:
+        content_hash = hash_content(content)
+        cas.put(content)
+        return cls(
+            item_id=item_id,
+            trajectory_id=trajectory_id,
+            source_id=source_id,
+            retrieval_query=retrieval_query,
+            content="",
+            content_hash=content_hash,
+            metadata=metadata or (),
+            provenance=provenance or _DEFAULT_PROVENANCE,
+            content_ref=ContentReference(
+                content_hash=content_hash,
+                byte_length=len(content.encode("utf-8")),
+            ),
         )
 
 
@@ -401,14 +447,21 @@ class ToolResult:
     content_hash: ContentHash
     received_at: datetime = field(default_factory=utc_now)
     provenance: Provenance = field(default_factory=lambda: _DEFAULT_PROVENANCE)
+    content_ref: ContentReference | None = None
 
     def __post_init__(self) -> None:
-        expected = hash_content(self.content)
-        if expected != self.content_hash:
-            raise ValueError(
-                f"ToolResult {self.result_id}: content_hash mismatch: "
-                f"expected {expected}, got {self.content_hash}"
-            )
+        if self.content_ref is None:
+            expected = hash_content(self.content)
+            if expected != self.content_hash:
+                raise ValueError(
+                    f"ToolResult {self.result_id}: content_hash mismatch: "
+                    f"expected {expected}, got {self.content_hash}"
+                )
+
+    def resolve_content(self, store: ContentAddressedStore) -> str:
+        if self.content_ref is not None:
+            return store.get_text(self.content_ref.content_hash)
+        return self.content
 
     @classmethod
     def create(
@@ -431,6 +484,34 @@ class ToolResult:
             provenance=provenance or _DEFAULT_PROVENANCE,
         )
 
+    @classmethod
+    def create_with_cas(
+        cls,
+        *,
+        result_id: ToolInvocationId,
+        invocation_id: ToolInvocationId,
+        trajectory_id: TrajectoryId,
+        status: ToolStatus,
+        content: str,
+        provenance: Provenance | None = None,
+        cas: ContentAddressedStore,
+    ) -> ToolResult:
+        content_hash = hash_content(content)
+        cas.put(content)
+        return cls(
+            result_id=result_id,
+            invocation_id=invocation_id,
+            trajectory_id=trajectory_id,
+            status=status,
+            content="",
+            content_hash=content_hash,
+            provenance=provenance or _DEFAULT_PROVENANCE,
+            content_ref=ContentReference(
+                content_hash=content_hash,
+                byte_length=len(content.encode("utf-8")),
+            ),
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class SubmissionRecord:
@@ -443,14 +524,21 @@ class SubmissionRecord:
     source_ids: tuple[str, ...] = field(default_factory=tuple)
     submitted_at: datetime = field(default_factory=utc_now)
     provenance: Provenance = field(default_factory=lambda: _DEFAULT_PROVENANCE)
+    content_ref: ContentReference | None = None
 
     def __post_init__(self) -> None:
-        expected = hash_content(self.content)
-        if expected != self.content_hash:
-            raise ValueError(
-                f"SubmissionRecord {self.submission_id}: content_hash mismatch: "
-                f"expected {expected}, got {self.content_hash}"
-            )
+        if self.content_ref is None:
+            expected = hash_content(self.content)
+            if expected != self.content_hash:
+                raise ValueError(
+                    f"SubmissionRecord {self.submission_id}: content_hash mismatch: "
+                    f"expected {expected}, got {self.content_hash}"
+                )
+
+    def resolve_content(self, store: ContentAddressedStore) -> str:
+        if self.content_ref is not None:
+            return store.get_text(self.content_ref.content_hash)
+        return self.content
 
     @classmethod
     def create(
@@ -469,6 +557,32 @@ class SubmissionRecord:
             content_hash=hash_content(content),
             source_ids=source_ids or (),
             provenance=provenance or _DEFAULT_PROVENANCE,
+        )
+
+    @classmethod
+    def create_with_cas(
+        cls,
+        *,
+        submission_id: SubmissionId,
+        trajectory_id: TrajectoryId,
+        content: str,
+        source_ids: tuple[str, ...] | None = None,
+        provenance: Provenance | None = None,
+        cas: ContentAddressedStore,
+    ) -> SubmissionRecord:
+        content_hash = hash_content(content)
+        cas.put(content)
+        return cls(
+            submission_id=submission_id,
+            trajectory_id=trajectory_id,
+            content="",
+            content_hash=content_hash,
+            source_ids=source_ids or (),
+            provenance=provenance or _DEFAULT_PROVENANCE,
+            content_ref=ContentReference(
+                content_hash=content_hash,
+                byte_length=len(content.encode("utf-8")),
+            ),
         )
 
 

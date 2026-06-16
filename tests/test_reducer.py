@@ -17,9 +17,12 @@ from rfsn_agent.domain import (
 )
 from rfsn_agent.events import (
     ActionCommittedPayload,
+    CandidateAddedPayload,
+    ClaimCreatedPayload,
     ClaimRevisedPayload,
     ContextPrunedPayload,
     EvidenceCuratedPayload,
+    EvidenceLinkedPayload,
     EvidenceVerifiedPayload,
     HarnessEvent,
     SnapshotCheckpointedPayload,
@@ -571,6 +574,250 @@ def test_wrong_previous_hash_fails() -> None:
     )
     with pytest.raises(InvariantError, match="Event chain mismatch"):
         reduce_event(snap2, second)
+
+
+def test_candidate_added() -> None:
+    snap = _empty_snapshot()
+    event = _event(
+        snap,
+        1,
+        "candidate_added",
+        CandidateAddedPayload(
+            item_id="cand-1",
+            trajectory_id="traj-1",
+            source_id="src-1",
+            retrieval_query="q",
+            content="candidate body",
+        ),
+        "idem-1",
+    )
+    snap2 = reduce_event(snap, event)
+    assert len(snap2.candidates) == 1
+    assert snap2.candidates[0].item_id == "cand-1"
+    assert snap2.candidates[0].content == "candidate body"
+
+
+def test_duplicate_candidate_added_fails() -> None:
+    snap = HarnessSnapshot.create(
+        trajectory_id="traj-1",
+        epoch_id="epoch-0",
+        sequence=0,
+        candidates=(
+            CandidateItem.create(
+                item_id="cand-1",
+                trajectory_id="traj-1",
+                source_id="src-1",
+                retrieval_query="q",
+                content="candidate body",
+            ),
+        ),
+    )
+    event = _event(
+        snap,
+        1,
+        "candidate_added",
+        CandidateAddedPayload(
+            item_id="cand-1",
+            trajectory_id="traj-1",
+            source_id="src-1",
+            retrieval_query="q",
+            content="candidate body",
+        ),
+        "idem-1",
+    )
+    with pytest.raises(InvariantError, match="Duplicate CandidateItem id"):
+        reduce_event(snap, event)
+
+
+def test_claim_created() -> None:
+    snap = _empty_snapshot()
+    event = _event(
+        snap,
+        1,
+        "claim_created",
+        ClaimCreatedPayload(
+            claim_id="claim-1",
+            trajectory_id="traj-1",
+            content="claim body",
+        ),
+        "idem-1",
+    )
+    snap2 = reduce_event(snap, event)
+    assert len(snap2.claims) == 1
+    assert snap2.claims[0].claim_id == "claim-1"
+    assert snap2.claims[0].content == "claim body"
+    assert snap2.claims[0].status == ClaimStatus.STATED
+
+
+def test_duplicate_claim_created_fails() -> None:
+    snap = HarnessSnapshot.create(
+        trajectory_id="traj-1",
+        epoch_id="epoch-0",
+        sequence=0,
+        claims=(
+            Claim.create(
+                claim_id="claim-1",
+                trajectory_id="traj-1",
+                content="claim body",
+            ),
+        ),
+    )
+    event = _event(
+        snap,
+        1,
+        "claim_created",
+        ClaimCreatedPayload(
+            claim_id="claim-1",
+            trajectory_id="traj-1",
+            content="claim body",
+        ),
+        "idem-1",
+    )
+    with pytest.raises(InvariantError, match="Duplicate Claim id"):
+        reduce_event(snap, event)
+
+
+def test_evidence_linked() -> None:
+    snap = HarnessSnapshot.create(
+        trajectory_id="traj-1",
+        epoch_id="epoch-0",
+        sequence=0,
+        claims=(
+            Claim.create(
+                claim_id="claim-1",
+                trajectory_id="traj-1",
+                content="foo",
+            ),
+        ),
+        curated_items=(
+            CuratedItem.create(
+                item_id="cur-1",
+                trajectory_id="traj-1",
+                candidate_ids=(),
+                content="evidence",
+            ),
+        ),
+    )
+    event = _event(
+        snap,
+        1,
+        "evidence_linked",
+        EvidenceLinkedPayload(
+            link_id="link-1",
+            trajectory_id="traj-1",
+            claim_id="claim-1",
+            curated_item_id="cur-1",
+            relationship="supports",
+            strength=0.9,
+        ),
+        "idem-1",
+    )
+    snap2 = reduce_event(snap, event)
+    assert len(snap2.evidence_links) == 1
+    assert snap2.evidence_links[0].link_id == "link-1"
+    assert snap2.evidence_links[0].relationship == "supports"
+    assert snap2.evidence_links[0].strength == 0.9
+    assert snap2.claims[0].evidence_link_ids == ("link-1",)
+
+
+def test_evidence_linked_unknown_claim_fails() -> None:
+    snap = _empty_snapshot()
+    event = _event(
+        snap,
+        1,
+        "evidence_linked",
+        EvidenceLinkedPayload(
+            link_id="link-1",
+            trajectory_id="traj-1",
+            claim_id="claim-1",
+            curated_item_id="cur-1",
+            relationship="supports",
+            strength=0.9,
+        ),
+        "idem-1",
+    )
+    with pytest.raises(InvariantError, match="unknown claim"):
+        reduce_event(snap, event)
+
+
+def test_evidence_linked_unknown_curated_fails() -> None:
+    snap = HarnessSnapshot.create(
+        trajectory_id="traj-1",
+        epoch_id="epoch-0",
+        sequence=0,
+        claims=(
+            Claim.create(
+                claim_id="claim-1",
+                trajectory_id="traj-1",
+                content="foo",
+            ),
+        ),
+    )
+    event = _event(
+        snap,
+        1,
+        "evidence_linked",
+        EvidenceLinkedPayload(
+            link_id="link-1",
+            trajectory_id="traj-1",
+            claim_id="claim-1",
+            curated_item_id="cur-1",
+            relationship="supports",
+            strength=0.9,
+        ),
+        "idem-1",
+    )
+    with pytest.raises(InvariantError, match="unknown curated item"):
+        reduce_event(snap, event)
+
+
+def test_duplicate_evidence_linked_fails() -> None:
+    snap = HarnessSnapshot.create(
+        trajectory_id="traj-1",
+        epoch_id="epoch-0",
+        sequence=0,
+        claims=(
+            Claim.create(
+                claim_id="claim-1",
+                trajectory_id="traj-1",
+                content="foo",
+            ),
+        ),
+        curated_items=(
+            CuratedItem.create(
+                item_id="cur-1",
+                trajectory_id="traj-1",
+                candidate_ids=(),
+                content="evidence",
+            ),
+        ),
+        evidence_links=(
+            EvidenceLink(
+                link_id="link-1",
+                trajectory_id="traj-1",
+                claim_id="claim-1",
+                curated_item_id="cur-1",
+                relationship="supports",
+                strength=0.9,
+            ),
+        ),
+    )
+    event = _event(
+        snap,
+        1,
+        "evidence_linked",
+        EvidenceLinkedPayload(
+            link_id="link-1",
+            trajectory_id="traj-1",
+            claim_id="claim-1",
+            curated_item_id="cur-1",
+            relationship="supports",
+            strength=0.9,
+        ),
+        "idem-1",
+    )
+    with pytest.raises(InvariantError, match="Duplicate EvidenceLink id"):
+        reduce_event(snap, event)
 
 
 def test_wrong_chain_hash_fails() -> None:

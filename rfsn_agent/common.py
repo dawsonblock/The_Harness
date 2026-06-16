@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 import types
@@ -64,10 +65,18 @@ def dataclass_from_dict(cls: type[T], data: dict[str, Any]) -> T:
 
     hints = get_type_hints(cls_any)
     kwargs: dict[str, Any] = {}
-    for field_name in cls_any.__dataclass_fields__:
-        raw = data[field_name]
-        field_type = hints[field_name]
-        kwargs[field_name] = _deserialize_value(raw, field_type)
+    for field_name, field_info in cls_any.__dataclass_fields__.items():
+        if field_name in data:
+            raw = data[field_name]
+            field_type = hints[field_name]
+            kwargs[field_name] = _deserialize_value(raw, field_type)
+        else:
+            if field_info.default is not dataclasses.MISSING:
+                kwargs[field_name] = field_info.default
+            elif field_info.default_factory is not dataclasses.MISSING:
+                kwargs[field_name] = field_info.default_factory()
+            else:
+                raise KeyError(f"Missing required field {field_name!r} for {cls.__name__}")
     return cls(**kwargs)
 
 

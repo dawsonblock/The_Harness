@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import Enum, auto
 from typing import Any, Protocol
 
 from rfsn_agent.common import canonical_json, hash_content
@@ -31,6 +32,110 @@ class WhitespaceTokenCounter:
 
     def count(self, text: str) -> int:
         return len(text.split())
+
+
+class TiktokenTokenCounter:
+    """Token counter backed by tiktoken, falling back to whitespace counting."""
+
+    def __init__(self) -> None:
+        try:
+            import tiktoken  # type: ignore[import-not-found]
+
+            self._encoding = tiktoken.get_encoding("cl100k_base")
+        except Exception:
+            self._encoding = None
+
+    def count(self, text: str) -> int:
+        if self._encoding is None:
+            return len(text.split())
+        return len(self._encoding.encode(text))
+
+
+class TrustedRole(Enum):
+    """Trust boundary roles for context segments."""
+
+    SYSTEM = auto()
+    USER = auto()
+    ASSISTANT = auto()
+    TOOL = auto()
+
+
+class ContextSelector(Protocol):
+    """Protocol for selecting context segments from a snapshot."""
+
+    def select(
+        self,
+        snapshot: HarnessSnapshot,
+        config: CompilerConfig,
+        token_counter: TokenCounter,
+    ) -> list[ContextSegment]:
+        ...
+
+
+class ContextRenderer(Protocol):
+    """Protocol for rendering context segments into a model-specific string."""
+
+    def render(self, segments: list[ContextSegment], model_type: str = "gpt4") -> str:
+        ...
+
+
+class DefaultContextSelector:
+    """Default selector that replicates the original compile_context selection logic."""
+
+    def select(
+        self,
+        snapshot: HarnessSnapshot,
+        config: CompilerConfig,
+        token_counter: TokenCounter,
+    ) -> list[ContextSegment]:
+        segments = _collect_segments(snapshot, config)
+
+        # Exact deduplication by content hash (keep first occurrence).
+        seen_hashes: set[str] = set()
+        deduped: list[ContextSegment] = []
+        for segment in segments:
+            if segment.content_hash in seen_hashes:
+                continue
+            seen_hashes.add(segment.content_hash)
+            deduped.append(segment)
+
+        # Allocate tokens and truncate.
+        allocated = _allocate_tokens(deduped, config, token_counter)
+
+        # Add retrieval handles for omitted material.
+        final_segments = _add_retrieval_handles(
+            allocated, snapshot, config, token_counter
+        )
+        return final_segments
+
+
+class JinjaContextRenderer:
+    """Renderer that formats segments for specific LLM formats."""
+
+    def render(self, segments: list[ContextSegment], model_type: str = "gpt4") -> str:
+        if model_type == "llama3":
+            parts = ["<|begin_of_text|>"]
+            for seg in segments:
+                parts.append(f'<segment kind="{seg.kind}">')
+                parts.append(seg.content)
+                parts.append("</segment>")
+            parts.append("<|end_of_text|>")
+            return "\n".join(parts)
+        elif model_type == "gpt4":
+            parts = []
+            for seg in segments:
+                parts.append(f"### {seg.kind}\n{seg.content}")
+            return "\n\n".join(parts)
+        elif model_type == "claude":
+            parts = []
+            for seg in segments:
+                parts.append(f"[{seg.kind}]\n{seg.content}")
+            return "\n\n".join(parts)
+        else:
+            parts = []
+            for seg in segments:
+                parts.append(f"### {seg.kind}\n{seg.content}")
+            return "\n\n".join(parts)
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,6 +178,7 @@ class ContextSegment:
     token_count: int
     source_ids: tuple[str, ...]
     content_hash: str
+    role: TrustedRole = TrustedRole.SYSTEM
 
     def __post_init__(self) -> None:
         expected = hash_content(self.content)
@@ -91,6 +197,7 @@ class ContextSegment:
         priority: int,
         content: str,
         source_ids: tuple[str, ...] | None = None,
+        role: TrustedRole = TrustedRole.SYSTEM,
     ) -> ContextSegment:
         return cls(
             segment_id=segment_id,
@@ -100,6 +207,7 @@ class ContextSegment:
             token_count=0,  # filled by compiler
             source_ids=source_ids or (),
             content_hash=hash_content(content),
+            role=role,
         )
 
     def with_token_count(self, token_count: int) -> ContextSegment:
@@ -111,6 +219,7 @@ class ContextSegment:
             token_count=token_count,
             source_ids=self.source_ids,
             content_hash=self.content_hash,
+            role=self.role,
         )
 
 
@@ -125,6 +234,7 @@ class ContextPacket:
     total_tokens: int
     source_hashes: tuple[str, ...]
     packet_hash: str
+    token_ids: tuple[int, ...] | None = None
 
     def __post_init__(self) -> None:
         expected = self._compute_packet_hash()
@@ -141,6 +251,7 @@ class ContextPacket:
             "segments": [canonical_json(s) for s in self.segments],
             "total_tokens": self.total_tokens,
             "source_hashes": sorted(self.source_hashes),
+            "token_ids": list(self.token_ids) if self.token_ids is not None else None,
         }
         return hash_content(canonical_json(payload))
 
@@ -154,6 +265,7 @@ class ContextPacket:
         segments: tuple[ContextSegment, ...],
         total_tokens: int,
         source_hashes: tuple[str, ...],
+        token_ids: tuple[int, ...] | None = None,
     ) -> ContextPacket:
         # Use object.__new__ to compute hash before __post_init__ validation.
         fields: dict[str, Any] = {
@@ -164,6 +276,7 @@ class ContextPacket:
             "total_tokens": total_tokens,
             "source_hashes": source_hashes,
             "packet_hash": "",
+            "token_ids": token_ids,
         }
         transient = object.__new__(cls)
         for name, value in fields.items():
@@ -194,29 +307,23 @@ def compile_context(
     config: CompilerConfig,
     token_counter: TokenCounter | None = None,
     previous_packet: ContextPacket | None = None,
+    renderer: ContextRenderer | None = None,
+    model_type: str = "gpt4",
 ) -> ContextPacket:
     """Compile a harness snapshot into a deterministic ContextPacket."""
     counter = token_counter or WhitespaceTokenCounter()
 
-    # Stage 1: collect candidate segments.
-    segments = _collect_segments(snapshot, config)
+    # Stage 1-4: select segments using the default selector.
+    selector = DefaultContextSelector()
+    final_segments = selector.select(snapshot, config, counter)
 
-    # Stage 2: exact deduplication by content hash (keep first occurrence).
-    seen_hashes: set[str] = set()
-    deduped: list[ContextSegment] = []
-    for segment in segments:
-        if segment.content_hash in seen_hashes:
-            continue
-        seen_hashes.add(segment.content_hash)
-        deduped.append(segment)
+    # Stage 5: render with roles if a renderer is provided.
+    if renderer is not None:
+        final_segments = _render_with_roles(
+            final_segments, renderer, model_type, counter
+        )
 
-    # Stage 3: allocate tokens and truncate.
-    allocated = _allocate_tokens(deduped, config, counter)
-
-    # Stage 4: add retrieval handles for omitted material.
-    final_segments = _add_retrieval_handles(allocated, snapshot, config, counter)
-
-    # Stage 5: build packet.
+    # Stage 6: build packet.
     total_tokens = sum(s.token_count for s in final_segments)
     source_hashes = tuple(sorted({s.content_hash for s in final_segments}))
     packet = ContextPacket.create(
@@ -228,11 +335,56 @@ def compile_context(
         source_hashes=source_hashes,
     )
 
-    # Stage 6: compute epoch reuse if a previous packet is supplied.
+    # Stage 7: compute epoch reuse if a previous packet is supplied.
     if previous_packet is not None:
         _compute_epoch(previous_packet, packet)
 
     return packet
+
+
+def _render_with_roles(
+    segments: list[ContextSegment],
+    renderer: ContextRenderer,
+    model_type: str,
+    counter: TokenCounter,
+) -> list[ContextSegment]:
+    """Group segments by role, insert boundary markers between role changes, and render."""
+    if not segments:
+        return segments
+
+    marked_segments: list[ContextSegment] = []
+    prev_role: TrustedRole | None = None
+    for seg in segments:
+        if prev_role is not None and seg.role != prev_role:
+            boundary = _role_boundary_marker(seg.role)
+            boundary_seg = ContextSegment.create(
+                segment_id=f"role-boundary-{len(marked_segments)}",
+                kind="role_boundary",
+                priority=0,
+                content=boundary,
+                role=seg.role,
+            )
+            boundary_seg = boundary_seg.with_token_count(
+                counter.count(boundary_seg.content)
+            )
+            marked_segments.append(boundary_seg)
+        marked_segments.append(seg)
+        prev_role = seg.role
+
+    rendered = renderer.render(marked_segments, model_type)
+    rendered_seg = ContextSegment.create(
+        segment_id="rendered",
+        kind="rendered",
+        priority=0,
+        content=rendered,
+        role=TrustedRole.SYSTEM,
+    )
+    rendered_seg = rendered_seg.with_token_count(counter.count(rendered_seg.content))
+    return [rendered_seg]
+
+
+def _role_boundary_marker(role: TrustedRole) -> str:
+    return f"<|{role.name.lower()}|>"
 
 
 def _collect_segments(
@@ -257,24 +409,26 @@ def _collect_segments(
     if verified_items:
         segments.append(_verified_evidence_segment(verified_items, config))
 
-    # Contradiction notes.
-    contradictions = _contradiction_segments(snapshot, config)
-    segments.extend(contradictions)
+    # Active (unverified) evidence.
+    unverified_items = [
+        c for c in snapshot.curated_items if c.item_id not in verified_item_ids
+    ]
+    if unverified_items:
+        segments.append(_active_evidence_segment(unverified_items, config))
 
-    # Active curated evidence (not verified).
-    active_items = [c for c in snapshot.curated_items if c.item_id not in verified_item_ids]
-    if active_items:
-        segments.append(_active_evidence_segment(active_items, config))
+    # Contradictions and withdrawn claims.
+    segments.extend(_contradiction_segments(snapshot, config))
 
-    # Recent tool results.
-    recent_results = snapshot.tool_results[-config.max_tool_results :]
-    if recent_results:
-        segments.append(_tool_results_segment(recent_results, config))
+    # Tool results.
+    recent_tool_results = snapshot.tool_results[-config.max_tool_results :]
+    if recent_tool_results:
+        segments.append(_tool_results_segment(recent_tool_results, config))
 
-    # Optional candidate previews.
-    if config.include_candidate_previews and snapshot.candidates:
-        previews = snapshot.candidates[: config.max_candidate_previews]
-        segments.append(_candidate_preview_segment(previews, config))
+    # Candidate previews.
+    if config.include_candidate_previews:
+        recent_candidates = snapshot.candidates[-config.max_candidate_previews :]
+        if recent_candidates:
+            segments.append(_candidate_preview_segment(recent_candidates, config))
 
     return segments
 
@@ -297,6 +451,7 @@ def _task_constraints_segment(
         kind="task_constraints",
         priority=config.task_constraints_priority,
         content=content,
+        role=TrustedRole.SYSTEM,
     )
 
 
@@ -307,6 +462,7 @@ def _plan_segment(unresolved: list[TaskNode], config: CompilerConfig) -> Context
         kind="plan",
         priority=config.plan_priority,
         content="Plan\n" + "\n".join(lines),
+        role=TrustedRole.SYSTEM,
     )
 
 
@@ -320,6 +476,7 @@ def _verified_evidence_segment(
         priority=config.verified_evidence_priority,
         content="Verified evidence\n" + "\n".join(lines),
         source_ids=tuple(i.item_id for i in items),
+        role=TrustedRole.SYSTEM,
     )
 
 
@@ -333,6 +490,7 @@ def _active_evidence_segment(
         priority=config.active_evidence_priority,
         content="Active evidence\n" + "\n".join(lines),
         source_ids=tuple(i.item_id for i in items),
+        role=TrustedRole.SYSTEM,
     )
 
 
@@ -346,6 +504,7 @@ def _tool_results_segment(
         priority=config.tool_results_priority,
         content="Recent tool results\n" + "\n".join(lines),
         source_ids=tuple(r.result_id for r in results),
+        role=TrustedRole.TOOL,
     )
 
 
@@ -359,6 +518,7 @@ def _candidate_preview_segment(
         priority=config.candidate_preview_priority,
         content="Candidate previews\n" + "\n".join(lines),
         source_ids=tuple(c.item_id for c in candidates),
+        role=TrustedRole.USER,
     )
 
 
@@ -387,6 +547,7 @@ def _contradiction_segments(
                 kind="contradiction_notes",
                 priority=config.contradiction_notes_priority,
                 content="Contradictions\n" + "\n".join(lines),
+                role=TrustedRole.SYSTEM,
             )
         )
     # Also include withdrawn claims as failure notes.
@@ -399,6 +560,7 @@ def _contradiction_segments(
                 kind="contradiction_notes",
                 priority=config.contradiction_notes_priority,
                 content="Withdrawn claims\n" + "\n".join(lines),
+                role=TrustedRole.SYSTEM,
             )
         )
     return segments
@@ -514,15 +676,27 @@ def compute_epoch(
     previous_packet: ContextPacket,
     current_packet: ContextPacket,
     cache_branch_id: str,
+    previous_token_ids: tuple[int, ...] | None = None,
+    current_token_ids: tuple[int, ...] | None = None,
 ) -> ContextEpoch:
     """Compare two packets and compute the prefix/suffix reuse boundary."""
-    prefix_tokens = 0
-    invalidated_tokens = current_packet.total_tokens
-    for prev, curr in zip(previous_packet.segments, current_packet.segments):
-        if prev.content_hash != curr.content_hash:
-            break
-        prefix_tokens += curr.token_count
-    invalidated_tokens = current_packet.total_tokens - prefix_tokens
+    if previous_token_ids is not None and current_token_ids is not None:
+        prefix_len = 0
+        for a, b in zip(previous_token_ids, current_token_ids):
+            if a == b:
+                prefix_len += 1
+            else:
+                break
+        prefix_tokens = prefix_len
+        invalidated_tokens = len(current_token_ids) - prefix_len
+    else:
+        prefix_tokens = 0
+        invalidated_tokens = current_packet.total_tokens
+        for prev, curr in zip(previous_packet.segments, current_packet.segments):
+            if prev.content_hash != curr.content_hash:
+                break
+            prefix_tokens += curr.token_count
+        invalidated_tokens = current_packet.total_tokens - prefix_tokens
     return ContextEpoch(
         epoch_id=current_packet.epoch_id,
         parent_epoch_id=previous_packet.epoch_id,

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import tempfile
 from pathlib import Path
 
@@ -11,12 +12,14 @@ from rfsn_agent.actions import (
     Action,
     ActionError,
     DecomposeAction,
+    ReadAction,
     SearchAction,
     SubmitAction,
 )
 from rfsn_agent.context import CompilerConfig
 from rfsn_agent.domain import BudgetLedger, HarnessSnapshot
 from rfsn_agent.runtime import Runtime
+from rfsn_agent.security import SecurityProfile
 from rfsn_agent.store import SQLiteEventStore
 
 
@@ -143,3 +146,72 @@ def test_runtime_rerun_uses_unique_run_ids() -> None:
         snap2 = runtime.run(traj, policy, max_steps=2)
         assert snap2.sequence == 4
         assert len(snap2.tasks) == 4
+
+
+def test_runtime_security_profile_blocks_unauthorized_tool() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        runtime, traj = _make_runtime(tmp)
+        profile = SecurityProfile(allowed_tool_names=frozenset({"read_file"}))
+        runtime.security_profile = profile
+        # web_search is not in the allow-list.
+        with pytest.raises(ActionError, match="Tool not allowed"):
+            runtime.execute(traj, SearchAction(query="foo"), action_id="act-1")
+
+
+def test_runtime_security_profile_blocks_forbidden_path() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        runtime, traj = _make_runtime(tmp)
+        profile = SecurityProfile(
+            forbidden_path_pattern=re.compile(r"\.\."),
+        )
+        runtime.security_profile = profile
+        with pytest.raises(ActionError, match="forbidden path"):
+            runtime.execute(traj, ReadAction(source_id="../secret"), action_id="act-1")
+
+
+def test_runtime_terminal_state_stops_on_submit() -> None:
+    steps = {"count": 0}
+
+    def policy(context: object, snapshot: HarnessSnapshot) -> Action:
+        steps["count"] += 1
+        if steps["count"] == 2:
+            return SubmitAction(
+                submission_id="sub-1", content="answer", source_ids=("src-1",)
+            )
+        return DecomposeAction(
+            task_id=f"task-{steps['count']}",
+            parent_task_id=None,
+            description=f"step {steps['count']}",
+            dependency_ids=(),
+        )
+
+    with tempfile.TemporaryDirectory() as tmp:
+        runtime, traj = _make_runtime(tmp)
+        snap = runtime.run(traj, policy, max_steps=5)
+        # Should stop at step 2 (the SubmitAction), not run all 5.
+        assert snap.sequence == 2
+        assert len(snap.submissions) == 1
+
+
+def test_runtime_terminal_state_can_be_disabled() -> None:
+    steps = {"count": 0}
+
+    def policy(context: object, snapshot: HarnessSnapshot) -> Action:
+        steps["count"] += 1
+        if steps["count"] == 2:
+            return SubmitAction(
+                submission_id="sub-1", content="answer", source_ids=("src-1",)
+            )
+        return DecomposeAction(
+            task_id=f"task-{steps['count']}",
+            parent_task_id=None,
+            description=f"step {steps['count']}",
+            dependency_ids=(),
+        )
+
+    with tempfile.TemporaryDirectory() as tmp:
+        runtime, traj = _make_runtime(tmp)
+        snap = runtime.run(traj, policy, max_steps=5, stop_on_submit=False)
+        # With stop_on_submit=False, it continues past the SubmitAction.
+        assert snap.sequence == 5
+        assert len(snap.submissions) == 1

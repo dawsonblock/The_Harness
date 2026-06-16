@@ -863,3 +863,98 @@ def test_v1_to_v3_migration_with_signing_key() -> None:
         events = store.get_events("traj-1")
         assert len(events) == 1
         assert events[0].header.signature is not None
+
+
+def test_automatic_checkpoint_at_sequence_50(monkeypatch: pytest.MonkeyPatch) -> None:
+    import rfsn_agent.reducer
+    import rfsn_agent.store
+    with tempfile.TemporaryDirectory() as tmp:
+        store = SQLiteEventStore(Path(tmp) / "events.db", cas_base_dir=Path(tmp) / "cas")
+        store.init_trajectory("traj-1")
+        snap = store.get_latest_snapshot("traj-1")
+
+        reduce_calls: list[int] = []
+        original_reduce = rfsn_agent.reducer.reduce_event
+
+        def counting_reduce(snap, event):
+            reduce_calls.append(event.sequence)
+            return original_reduce(snap, event)
+
+        monkeypatch.setattr(rfsn_agent.store, "reduce_event", counting_reduce)
+
+        expected_sequence = snap.sequence
+        expected_head_hash = snap.last_event_hash
+        for i in range(50):
+            prop = ProposedEvent(
+                event_type="action_committed",
+                payload=_committed_payload(),
+                idempotency_key=f"idem-{i}",
+                actor="policy",
+                action_id=f"act-{i}",
+            )
+            result = store.commit_events(
+                trajectory_id="traj-1",
+                expected_sequence=expected_sequence,
+                expected_head_hash=expected_head_hash,
+                proposed_events=(prop,),
+            )
+            expected_sequence = result.last_sequence
+            expected_head_hash = result.head_hash
+
+        assert store.get_latest_checkpoint_sequence("traj-1") == 50
+
+        # Verify loading the head uses the checkpoint (no replay needed)
+        reduce_calls.clear()
+        head = store.get_latest_snapshot("traj-1")
+        assert head.sequence == 50
+        assert len(reduce_calls) == 0
+
+
+def test_cas_offloading_large_payload() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        cas_dir = Path(tmp) / "cas"
+        store = SQLiteEventStore(Path(tmp) / "events.db", cas_base_dir=cas_dir)
+        store.init_trajectory("traj-1")
+        snap0 = store.get_latest_snapshot("traj-1")
+        large_content = "A" * 5000
+        prop = ProposedEvent(
+            event_type="submission_recorded",
+            payload=SubmissionRecordedPayload(
+                submission_id="sub-1",
+                content=large_content,
+                source_ids=("src-1",),
+            ),
+            idempotency_key="idem-large",
+            actor="policy",
+            action_id="act-1",
+        )
+        store.commit_events(
+            trajectory_id="traj-1",
+            expected_sequence=snap0.sequence,
+            expected_head_hash=snap0.last_event_hash,
+            proposed_events=(prop,),
+        )
+        # Verify the event can be loaded and content is intact
+        events = store.get_events("traj-1")
+        assert len(events) == 1
+        payload = events[0].payload
+        assert isinstance(payload, SubmissionRecordedPayload)
+        assert payload.content == large_content
+
+        # Verify the payload_json in DB contains the CAS reference, not the raw string
+        conn = sqlite3.connect(str(store.db_path))
+        cur = conn.cursor()
+        row = cur.execute(
+            "SELECT payload_json FROM harness_events WHERE trajectory_id = ?",
+            ("traj-1",),
+        ).fetchone()
+        assert row is not None
+        data = json.loads(row[0])
+        cas_ref = data["payload"]["content"]
+        assert isinstance(cas_ref, dict) and "__cas_ref__" in cas_ref
+        # Verify the hash exists in CAS
+        h = cas_ref["__cas_ref__"]
+        assert store.cas is not None
+        assert store.cas.exists(h) is True
+        assert store.cas.get_text(h) == large_content
+        conn.close()

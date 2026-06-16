@@ -312,7 +312,7 @@ class SQLiteEventStore:
                 )
 
                 head = reduce_event(head, event)
-                _insert_event(cur, event, request_hash)
+                _insert_event(cur, event, request_hash, self.cas)
                 committed.append(event)
                 receipt = CommitReceipt(
                     event_id=event_id,
@@ -329,6 +329,10 @@ class SQLiteEventStore:
                 next_sequence += 1
                 previous_hash = event_hash
                 previous_signature = signature
+
+            if head.sequence > 0 and head.sequence % 50 == 0:
+                event_count = self.get_event_count(trajectory_id)
+                _insert_snapshot(cur, head, event_count)
 
             cur.execute("COMMIT")
         except (StaleContextError, IdempotencyConflictError):
@@ -384,7 +388,7 @@ class SQLiteEventStore:
         """
         event_rows = cur.execute(event_sql, (trajectory_id, snapshot.sequence)).fetchall()
         for event_row in event_rows:
-            event = _event_from_row(event_row, self.signing_key)
+            event = _event_from_row(event_row, self.signing_key, self.cas)
             snapshot = reduce_event(snapshot, event)
         return snapshot
 
@@ -467,7 +471,7 @@ class SQLiteEventStore:
             sql += " LIMIT ?"
             params.append(limit)
         rows = cur.execute(sql, params).fetchall()
-        return [_event_from_row(row, self.signing_key) for row in rows]
+        return [_event_from_row(row, self.signing_key, self.cas) for row in rows]
 
     def get_event_count(self, trajectory_id: str) -> int:
         cur = self._cursor()
@@ -1110,7 +1114,16 @@ def _apply_v3_migration(
 # ---------------------------------------------------------------------------
 
 
-def _insert_event(cur: sqlite3.Cursor, event: HarnessEvent, request_hash: ContentHash) -> None:
+def _insert_event(
+    cur: sqlite3.Cursor,
+    event: HarnessEvent,
+    request_hash: ContentHash,
+    cas: ContentAddressedStore | None = None,
+) -> None:
+    event_dict = event.to_dict()
+    if cas is not None:
+        event_dict["payload"] = _maybe_offload_to_cas(event_dict["payload"], cas)
+    payload_json = json.dumps(event_dict, sort_keys=True)
     cur.execute(
         """
         INSERT INTO harness_events (
@@ -1137,7 +1150,7 @@ def _insert_event(cur: sqlite3.Cursor, event: HarnessEvent, request_hash: Conten
             event.header.event_hash,
             event.header.previous_signature,
             event.header.signature,
-            json.dumps(event.to_dict(), sort_keys=True),
+            payload_json,
         ),
     )
 
@@ -1167,7 +1180,9 @@ def _insert_snapshot(
 
 
 def _event_from_row(
-    row: sqlite3.Row, signing_key: bytes | None
+    row: sqlite3.Row,
+    signing_key: bytes | None,
+    cas: ContentAddressedStore | None = None,
 ) -> HarnessEvent:
     """Reconstruct a HarnessEvent from SQL columns and payload JSON.
 
@@ -1175,6 +1190,8 @@ def _event_from_row(
     and signatures are verified when a ``signing_key`` is configured.
     """
     data = json.loads(row["payload_json"])
+    if cas is not None:
+        data["payload"] = _maybe_resolve_from_cas(data["payload"], cas)
     header = data["header"]
 
     sql_fields = {
@@ -1227,6 +1244,32 @@ def _event_from_row(
             f"Event {row['event_id']} signature verification failed"
         ) from exc
     return event
+
+
+def _maybe_offload_to_cas(obj: Any, cas: ContentAddressedStore | None) -> Any:
+    if cas is None:
+        return obj
+    if isinstance(obj, str):
+        if len(obj) > 4096:
+            return {"__cas_ref__": cas.put(obj)}
+        return obj
+    if isinstance(obj, list):
+        return [_maybe_offload_to_cas(item, cas) for item in obj]
+    if isinstance(obj, dict):
+        return {k: _maybe_offload_to_cas(v, cas) for k, v in obj.items()}
+    return obj
+
+
+def _maybe_resolve_from_cas(obj: Any, cas: ContentAddressedStore | None) -> Any:
+    if isinstance(obj, list):
+        return [_maybe_resolve_from_cas(item, cas) for item in obj]
+    if isinstance(obj, dict):
+        if set(obj.keys()) == {"__cas_ref__"} and isinstance(obj["__cas_ref__"], str):
+            if cas is None:
+                raise StoreError("CAS reference found but CAS is not configured")
+            return cas.get_text(obj["__cas_ref__"])
+        return {k: _maybe_resolve_from_cas(v, cas) for k, v in obj.items()}
+    return obj
 
 
 def _payload_to_dict(payload: Any) -> dict[str, Any]:

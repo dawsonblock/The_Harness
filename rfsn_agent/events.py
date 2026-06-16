@@ -133,6 +133,32 @@ class SnapshotCheckpointedPayload:
     snapshot_hash: ContentHash
 
 
+@dataclass(frozen=True, slots=True)
+class CandidateAddedPayload:
+    item_id: ItemId
+    trajectory_id: TrajectoryId
+    source_id: str
+    retrieval_query: str
+    content: str
+
+
+@dataclass(frozen=True, slots=True)
+class ClaimCreatedPayload:
+    claim_id: ClaimId
+    trajectory_id: TrajectoryId
+    content: str
+
+
+@dataclass(frozen=True, slots=True)
+class EvidenceLinkedPayload:
+    link_id: LinkId
+    trajectory_id: TrajectoryId
+    claim_id: ClaimId
+    curated_item_id: ItemId
+    relationship: str
+    strength: float
+
+
 EventPayload = (
     ActionCommittedPayload
     | ToolInvokedPayload
@@ -145,6 +171,9 @@ EventPayload = (
     | ContextPrunedPayload
     | SubmissionRecordedPayload
     | SnapshotCheckpointedPayload
+    | CandidateAddedPayload
+    | ClaimCreatedPayload
+    | EvidenceLinkedPayload
 )
 
 
@@ -429,6 +458,9 @@ def payload_type_name(payload: EventPayload) -> str:
         ContextPrunedPayload: "context_pruned",
         SubmissionRecordedPayload: "submission_recorded",
         SnapshotCheckpointedPayload: "snapshot_checkpointed",
+        CandidateAddedPayload: "candidate_added",
+        ClaimCreatedPayload: "claim_created",
+        EvidenceLinkedPayload: "evidence_linked",
     }
     return mapping[type(payload)]
 
@@ -547,5 +579,28 @@ def _payload_from_dict(event_type: str, data: dict[str, Any]) -> EventPayload:
         return SnapshotCheckpointedPayload(
             snapshot_sequence=int(data["snapshot_sequence"]),
             snapshot_hash=ContentHash(data["snapshot_hash"]),
+        )
+    if event_type == "candidate_added":
+        return CandidateAddedPayload(
+            item_id=ItemId(data["item_id"]),
+            trajectory_id=TrajectoryId(data["trajectory_id"]),
+            source_id=data["source_id"],
+            retrieval_query=data["retrieval_query"],
+            content=data["content"],
+        )
+    if event_type == "claim_created":
+        return ClaimCreatedPayload(
+            claim_id=ClaimId(data["claim_id"]),
+            trajectory_id=TrajectoryId(data["trajectory_id"]),
+            content=data["content"],
+        )
+    if event_type == "evidence_linked":
+        return EvidenceLinkedPayload(
+            link_id=LinkId(data["link_id"]),
+            trajectory_id=TrajectoryId(data["trajectory_id"]),
+            claim_id=ClaimId(data["claim_id"]),
+            curated_item_id=ItemId(data["curated_item_id"]),
+            relationship=data["relationship"],
+            strength=float(data["strength"]),
         )
     raise ValueError(f"Cannot deserialize unknown event type: {event_type}")

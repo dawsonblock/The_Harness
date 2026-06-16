@@ -11,9 +11,12 @@ from rfsn_agent.common import canonical_json, hash_content
 from rfsn_agent.events import (
     CURRENT_EVENT_SCHEMA_VERSION,
     ActionCommittedPayload,
+    CandidateAddedPayload,
+    ClaimCreatedPayload,
     ClaimRevisedPayload,
     ContextPrunedPayload,
     EvidenceCuratedPayload,
+    EvidenceLinkedPayload,
     EvidenceVerifiedPayload,
     HarnessEvent,
     SnapshotCheckpointedPayload,
@@ -222,6 +225,26 @@ def test_all_payload_round_trip_through_dict() -> None:
             submission_id="sub-1", content="answer", source_ids=("src-1",)
         ),
         SnapshotCheckpointedPayload(snapshot_sequence=5, snapshot_hash="a" * 64),
+        CandidateAddedPayload(
+            item_id="cand-1",
+            trajectory_id="traj-1",
+            source_id="src-1",
+            retrieval_query="q",
+            content="candidate body",
+        ),
+        ClaimCreatedPayload(
+            claim_id="claim-1",
+            trajectory_id="traj-1",
+            content="claim body",
+        ),
+        EvidenceLinkedPayload(
+            link_id="link-1",
+            trajectory_id="traj-1",
+            claim_id="claim-1",
+            curated_item_id="cur-1",
+            relationship="supports",
+            strength=0.9,
+        ),
     ]
     for idx, payload in enumerate(payloads):
         event_type = payload_type_name(payload)  # type: ignore[arg-type]

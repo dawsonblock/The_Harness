@@ -21,9 +21,12 @@ from rfsn_agent.domain import (
 )
 from rfsn_agent.events import (
     CURRENT_EVENT_SCHEMA_VERSION,
+    CandidateAddedPayload,
+    ClaimCreatedPayload,
     ClaimRevisedPayload,
     ContextPrunedPayload,
     EvidenceCuratedPayload,
+    EvidenceLinkedPayload,
     EvidenceVerifiedPayload,
     HarnessEvent,
     SnapshotCheckpointedPayload,
@@ -34,7 +37,13 @@ from rfsn_agent.events import (
     ToolResultReceivedPayload,
     payload_type_name,
 )
-from rfsn_agent.types import TaskStatus, ToolStatus, VerificationResult, VerificationStatus
+from rfsn_agent.types import (
+    ClaimStatus,
+    TaskStatus,
+    ToolStatus,
+    VerificationResult,
+    VerificationStatus,
+)
 
 
 class ReducerError(ValueError):
@@ -448,6 +457,95 @@ def _handle_snapshot_checkpointed(
     return _next_snapshot(snapshot, event)
 
 
+def _handle_candidate_added(
+    snapshot: HarnessSnapshot, event: HarnessEvent
+) -> HarnessSnapshot:
+    payload = _expect_payload_type(event.payload, CandidateAddedPayload)
+    _require_unique(payload.item_id, {c.item_id for c in snapshot.candidates}, "CandidateItem")
+    candidate = CandidateItem.create(
+        item_id=payload.item_id,
+        trajectory_id=event.trajectory_id,
+        source_id=payload.source_id,
+        retrieval_query=payload.retrieval_query,
+        content=payload.content,
+        provenance=_with_event_provenance(event),
+    )
+    return _next_snapshot(
+        snapshot,
+        event,
+        candidates=snapshot.candidates + (candidate,),
+    )
+
+
+def _handle_claim_created(
+    snapshot: HarnessSnapshot, event: HarnessEvent
+) -> HarnessSnapshot:
+    payload = _expect_payload_type(event.payload, ClaimCreatedPayload)
+    _require_unique(payload.claim_id, {c.claim_id for c in snapshot.claims}, "Claim")
+    claim = Claim.create(
+        claim_id=payload.claim_id,
+        trajectory_id=event.trajectory_id,
+        content=payload.content,
+        status=ClaimStatus.STATED,
+        provenance=_with_event_provenance(event),
+    )
+    return _next_snapshot(
+        snapshot,
+        event,
+        claims=snapshot.claims + (claim,),
+    )
+
+
+def _handle_evidence_linked(
+    snapshot: HarnessSnapshot, event: HarnessEvent
+) -> HarnessSnapshot:
+    payload = _expect_payload_type(event.payload, EvidenceLinkedPayload)
+    _require_unique(
+        payload.link_id, {link.link_id for link in snapshot.evidence_links}, "EvidenceLink"
+    )
+    claim_ids = {c.claim_id for c in snapshot.claims}
+    if payload.claim_id not in claim_ids:
+        raise InvariantError(f"Evidence link references unknown claim: {payload.claim_id}")
+    curated_ids = {c.item_id for c in snapshot.curated_items}
+    if payload.curated_item_id not in curated_ids:
+        raise InvariantError(
+            f"Evidence link references unknown curated item: {payload.curated_item_id}"
+        )
+    link = EvidenceLink(
+        link_id=payload.link_id,
+        trajectory_id=event.trajectory_id,
+        claim_id=payload.claim_id,
+        curated_item_id=payload.curated_item_id,
+        relationship=payload.relationship,
+        strength=payload.strength,
+        provenance=_with_event_provenance(event),
+    )
+    # Update claim's evidence_link_ids
+    claim_index = _index_by_id(snapshot.claims, lambda c: c.claim_id, payload.claim_id)
+    old_claim = snapshot.claims[claim_index]
+    if payload.link_id not in old_claim.evidence_link_ids:
+        new_link_ids = old_claim.evidence_link_ids + (payload.link_id,)
+        updated_claim = Claim(
+            claim_id=old_claim.claim_id,
+            trajectory_id=old_claim.trajectory_id,
+            content=old_claim.content,
+            content_hash=old_claim.content_hash,
+            status=old_claim.status,
+            evidence_link_ids=new_link_ids,
+            created_at=old_claim.created_at,
+            provenance=old_claim.provenance,
+        )
+        claims = _replace_at(snapshot.claims, claim_index, updated_claim)
+    else:
+        claims = snapshot.claims
+    return _next_snapshot(
+        snapshot,
+        event,
+        claims=claims,
+        evidence_links=snapshot.evidence_links + (link,),
+    )
+
+
 _HANDLERS: dict[str, EventHandler] = {
     "action_committed": _handle_action_committed,
     "tool_invoked": _handle_tool_invoked,
@@ -460,6 +558,9 @@ _HANDLERS: dict[str, EventHandler] = {
     "context_pruned": _handle_context_pruned,
     "submission_recorded": _handle_submission_recorded,
     "snapshot_checkpointed": _handle_snapshot_checkpointed,
+    "candidate_added": _handle_candidate_added,
+    "claim_created": _handle_claim_created,
+    "evidence_linked": _handle_evidence_linked,
 }
 
 
