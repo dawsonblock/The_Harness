@@ -121,3 +121,25 @@ def test_runtime_respects_tool_call_budget() -> None:
         snap = runtime.run(traj, policy, max_steps=2)
         # The run stops on BudgetError after the first failed step.
         assert snap.sequence == 1
+
+
+def test_runtime_rerun_uses_unique_run_ids() -> None:
+    """Two separate Runtime.run() calls should not collide on idempotency keys."""
+    calls = {"count": 0}
+
+    def policy(context: object, snapshot: HarnessSnapshot) -> Action:
+        calls["count"] += 1
+        return DecomposeAction(
+            task_id=f"task-{calls['count']}",
+            parent_task_id=None,
+            description=f"step {calls['count']}",
+            dependency_ids=(),
+        )
+
+    with tempfile.TemporaryDirectory() as tmp:
+        runtime, traj = _make_runtime(tmp)
+        snap1 = runtime.run(traj, policy, max_steps=2)
+        assert snap1.sequence == 2
+        snap2 = runtime.run(traj, policy, max_steps=2)
+        assert snap2.sequence == 4
+        assert len(snap2.tasks) == 4

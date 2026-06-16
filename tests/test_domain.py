@@ -26,6 +26,7 @@ from rfsn_agent.types import (
     TaskStatus,
     ToolStatus,
     VerificationResult,
+    VerificationStatus,
 )
 
 
@@ -91,7 +92,7 @@ def test_claim_status_transition() -> None:
 
 
 def test_evidence_link_strength_bounds() -> None:
-    EvidenceLink(
+    link = EvidenceLink(
         link_id="link-1",
         trajectory_id="traj-1",
         claim_id="claim-1",
@@ -99,6 +100,7 @@ def test_evidence_link_strength_bounds() -> None:
         relationship="supports",
         strength=0.8,
     )
+    assert link.current_status == VerificationStatus.UNVERIFIED
 
     with pytest.raises(ValueError, match="strength must be in"):
         EvidenceLink(
@@ -115,6 +117,7 @@ def test_verification_record_hash() -> None:
     record = VerificationRecord.create(
         record_id="ver-1",
         trajectory_id="traj-1",
+        link_id="link-1",
         claim_id="claim-1",
         method="web_search",
         result=VerificationResult.CONFIRMED,
@@ -126,6 +129,7 @@ def test_verification_record_hash() -> None:
         VerificationRecord(
             record_id="ver-2",
             trajectory_id="traj-1",
+            link_id="link-1",
             claim_id="claim-1",
             method="web_search",
             result=VerificationResult.INCONCLUSIVE,
@@ -224,6 +228,7 @@ def test_harness_snapshot_state_hash() -> None:
             epoch_id="epoch-1",
             sequence=0,
             state_hash="badhash",
+            last_event_hash=None,
         )
 
 

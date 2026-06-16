@@ -148,7 +148,7 @@ def test_plan_decompose_event() -> None:
     events = plan_events(action, snap, action_id="act-1")
     assert len(events) == 1
     assert events[0].event_type == "task_decomposed"
-    assert events[0].sequence == 1
+    assert events[0].action_id == "act-1"
 
 
 def test_plan_search_event() -> None:
@@ -156,7 +156,7 @@ def test_plan_search_event() -> None:
     action = SearchAction(query="foo")
     events = plan_events(action, snap, action_id="act-1")
     assert events[0].event_type == "tool_invoked"
-    assert events[0].header.action_id == "act-1"
+    assert events[0].action_id == "act-1"
 
 
 def test_plan_submit_event() -> None:

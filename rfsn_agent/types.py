@@ -39,6 +39,14 @@ class VerificationResult(str, Enum):
     INCONCLUSIVE = "inconclusive"
 
 
+class VerificationStatus(str, Enum):
+    UNVERIFIED = "unverified"
+    VERIFIED = "verified"
+    REFUTED = "refuted"
+    INCONCLUSIVE = "inconclusive"
+    STALE = "stale"
+
+
 class ToolStatus(str, Enum):
     PENDING = "pending"
     RUNNING = "running"

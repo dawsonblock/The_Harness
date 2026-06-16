@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, cast
@@ -22,7 +24,9 @@ from rfsn_agent.types import (
     VerificationResult,
 )
 
-CURRENT_EVENT_SCHEMA_VERSION = 1
+CURRENT_EVENT_SCHEMA_VERSION = 3
+_EVENT_HASH_VERSION = 1
+_SIGNATURE_VERSION = 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,6 +43,10 @@ class EventHeader:
     created_at: datetime
     actor: str
     action_id: str
+    previous_event_hash: ContentHash | None
+    event_hash: ContentHash
+    previous_signature: ContentHash | None
+    signature: ContentHash | None
 
 
 # ---------------------------------------------------------------------------
@@ -141,6 +149,27 @@ EventPayload = (
 
 
 # ---------------------------------------------------------------------------
+# Proposed event (policy output, not yet assigned a committed envelope)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class ProposedEvent:
+    """A semantic event produced by policy planning.
+
+    The transactional store is responsible for assigning sequence, timestamp,
+    physical event_id, previous_event_hash, event_hash, and signature.
+    """
+
+    event_type: str
+    payload: EventPayload
+    idempotency_key: str
+    actor: str
+    action_id: str
+    parent_event_id: EventId | None = None
+
+
+# ---------------------------------------------------------------------------
 # Event envelope
 # ---------------------------------------------------------------------------
 
@@ -154,11 +183,25 @@ class HarnessEvent:
     payload_hash: ContentHash
 
     def __post_init__(self) -> None:
-        expected = hash_content(canonical_json(_payload_to_dict(self.payload)))
-        if expected != self.payload_hash:
+        expected_payload_hash = hash_content(canonical_json(_payload_to_dict(self.payload)))
+        if expected_payload_hash != self.payload_hash:
             raise ValueError(
                 f"HarnessEvent {self.header.event_id}: payload_hash mismatch: "
-                f"expected {expected}, got {self.payload_hash}"
+                f"expected {expected_payload_hash}, got {self.payload_hash}"
+            )
+
+        expected_event_hash = compute_event_hash(self.header, self.payload_hash)
+        if expected_event_hash != self.header.event_hash:
+            raise ValueError(
+                f"HarnessEvent {self.header.event_id}: event_hash mismatch: "
+                f"expected {expected_event_hash}, got {self.header.event_hash}"
+            )
+
+        expected_type = payload_type_name(self.payload)
+        if self.header.event_type != expected_type:
+            raise ValueError(
+                f"HarnessEvent {self.header.event_id}: event_type "
+                f"{self.header.event_type!r} does not match payload type {expected_type!r}"
             )
 
     @property
@@ -197,6 +240,10 @@ class HarnessEvent:
                 "created_at": self.header.created_at.isoformat(),
                 "actor": self.header.actor,
                 "action_id": self.header.action_id,
+                "previous_event_hash": self.header.previous_event_hash,
+                "event_hash": self.header.event_hash,
+                "previous_signature": self.header.previous_signature,
+                "signature": self.header.signature,
             },
             "payload": self.payload_to_dict(),
             "payload_hash": self.payload_hash,
@@ -223,10 +270,15 @@ class HarnessEvent:
         event_type: str,
         payload: EventPayload,
         idempotency_key: str,
+        previous_event_hash: ContentHash | None,
+        previous_signature: ContentHash | None = None,
+        signing_key: bytes | None = None,
         parent_event_id: EventId | None = None,
         actor: str = "system",
         action_id: str = "unknown",
+        created_at: datetime | None = None,
     ) -> HarnessEvent:
+        payload_hash = hash_content(canonical_json(_payload_to_dict(payload)))
         header = EventHeader(
             event_id=event_id,
             trajectory_id=trajectory_id,
@@ -235,12 +287,108 @@ class HarnessEvent:
             schema_version=CURRENT_EVENT_SCHEMA_VERSION,
             idempotency_key=idempotency_key,
             parent_event_id=parent_event_id,
-            created_at=utc_now(),
+            created_at=created_at if created_at is not None else utc_now(),
             actor=actor,
             action_id=action_id,
+            previous_event_hash=previous_event_hash,
+            event_hash=ContentHash(""),
+            previous_signature=previous_signature,
+            signature=None,
         )
-        payload_hash = hash_content(canonical_json(_payload_to_dict(payload)))
+        event_hash = compute_event_hash(header, payload_hash)
+        object.__setattr__(header, "event_hash", event_hash)
+        signature = compute_signature(header, signing_key)
+        object.__setattr__(header, "signature", signature)
         return cls(header=header, payload=payload, payload_hash=payload_hash)
+
+
+def compute_event_hash(header: EventHeader, payload_hash: ContentHash) -> ContentHash:
+    """Return the canonical SHA-256 hash over the full event envelope.
+
+    Every header field except ``event_hash`` and ``signature`` is included,
+    along with the ``payload_hash``. This makes it impossible to alter any
+    envelope field without invalidating the event hash.
+    """
+    material = {
+        "hash_version": _EVENT_HASH_VERSION,
+        "event_id": header.event_id,
+        "trajectory_id": header.trajectory_id,
+        "sequence": header.sequence,
+        "event_type": header.event_type,
+        "schema_version": header.schema_version,
+        "idempotency_key": header.idempotency_key,
+        "parent_event_id": header.parent_event_id,
+        "created_at": header.created_at.isoformat(),
+        "actor": header.actor,
+        "action_id": header.action_id,
+        "payload_hash": payload_hash,
+        "previous_event_hash": header.previous_event_hash,
+        "previous_signature": header.previous_signature,
+    }
+    return hash_content(canonical_json(material))
+
+
+def compute_signature(
+    header: EventHeader, signing_key: bytes | None
+) -> ContentHash | None:
+    """Return the HMAC-SHA-256 signature over the event hash chain.
+
+    When ``signing_key`` is ``None`` the event is unsigned. The signature
+    covers the event hash and the previous signature so that an attacker who
+    lacks the key cannot splice, reorder, or rewrite any part of the chain.
+    """
+    if signing_key is None:
+        return None
+    material = {
+        "signature_version": _SIGNATURE_VERSION,
+        "event_hash": header.event_hash,
+        "previous_signature": header.previous_signature,
+    }
+    digest = hmac.new(signing_key, canonical_json(material).encode("utf-8"), hashlib.sha256)
+    return ContentHash(digest.hexdigest())
+
+
+def verify_signature(
+    header: EventHeader, signing_key: bytes | None
+) -> None:
+    """Verify an event signature against the provided key.
+
+    Raises ``ValueError`` if the signature is missing when a key is configured,
+    or if the signature does not match.
+    """
+    expected = compute_signature(header, signing_key)
+    if expected is None:
+        if header.signature is not None:
+            raise ValueError(
+                f"HarnessEvent {header.event_id}: signature present but no signing key configured"
+            )
+        return
+    if header.signature is None:
+        raise ValueError(
+            f"HarnessEvent {header.event_id}: missing signature but signing key is configured"
+        )
+    if not hmac.compare_digest(expected, header.signature):
+        raise ValueError(
+            f"HarnessEvent {header.event_id}: signature mismatch"
+        )
+
+
+def compute_request_hash(proposed: ProposedEvent) -> ContentHash:
+    """Return a stable request hash for idempotency comparison.
+
+    The request hash excludes physical commit metadata (event_id, sequence,
+    timestamp, event_hash, signature) so that retries of the same logical
+    command compare equal even when the store assigns fresh physical
+    identifiers.
+    """
+    material = {
+        "event_type": proposed.event_type,
+        "payload": _payload_to_dict(proposed.payload),
+        "actor": proposed.actor,
+        "action_id": proposed.action_id,
+        "parent_event_id": proposed.parent_event_id,
+    }
+    return hash_content(canonical_json(material))
 
 
 def _payload_to_dict(payload: EventPayload) -> dict[str, Any]:
@@ -313,6 +461,16 @@ def _header_from_dict(data: dict[str, Any]) -> EventHeader:
         created_at=_parse_datetime(data["created_at"]),
         actor=str(data["actor"]),
         action_id=str(data["action_id"]),
+        previous_event_hash=ContentHash(data["previous_event_hash"])
+        if data.get("previous_event_hash") is not None
+        else None,
+        event_hash=ContentHash(data["event_hash"]),
+        previous_signature=ContentHash(data["previous_signature"])
+        if data.get("previous_signature") is not None
+        else None,
+        signature=ContentHash(data["signature"])
+        if data.get("signature") is not None
+        else None,
     )
 
 

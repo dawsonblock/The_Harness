@@ -27,6 +27,7 @@ from rfsn_agent.types import (
     TrajectoryId,
     VerificationId,
     VerificationResult,
+    VerificationStatus,
 )
 
 
@@ -212,7 +213,7 @@ class EvidenceLink:
     curated_item_id: ItemId
     relationship: str  # supports, contradicts, neutral
     strength: float
-    verified: bool = False
+    current_status: VerificationStatus = VerificationStatus.UNVERIFIED
     verification_id: VerificationId | None = None
     created_at: datetime = field(default_factory=utc_now)
     provenance: Provenance = field(default_factory=lambda: _DEFAULT_PROVENANCE)
@@ -226,10 +227,11 @@ class EvidenceLink:
 
 @dataclass(frozen=True, slots=True)
 class VerificationRecord:
-    """A record of an attempt to verify a claim or evidence link."""
+    """A record of an attempt to verify an evidence link."""
 
     record_id: VerificationId
     trajectory_id: TrajectoryId
+    link_id: LinkId
     claim_id: ClaimId
     method: str
     result: VerificationResult
@@ -252,6 +254,7 @@ class VerificationRecord:
         *,
         record_id: VerificationId,
         trajectory_id: TrajectoryId,
+        link_id: LinkId,
         claim_id: ClaimId,
         method: str,
         result: VerificationResult,
@@ -261,6 +264,7 @@ class VerificationRecord:
         return cls(
             record_id=record_id,
             trajectory_id=trajectory_id,
+            link_id=link_id,
             claim_id=claim_id,
             method=method,
             result=result,
@@ -476,6 +480,8 @@ class HarnessSnapshot:
     epoch_id: str
     sequence: int
     state_hash: ContentHash
+    last_event_hash: ContentHash | None
+    last_signature: ContentHash | None = None
     created_at: datetime = field(default_factory=utc_now)
     candidates: tuple[CandidateItem, ...] = field(default_factory=tuple)
     curated_items: tuple[CuratedItem, ...] = field(default_factory=tuple)
@@ -487,7 +493,6 @@ class HarnessSnapshot:
     submissions: tuple[SubmissionRecord, ...] = field(default_factory=tuple)
     tool_invocations: tuple[ToolInvocation, ...] = field(default_factory=tuple)
     tool_results: tuple[ToolResult, ...] = field(default_factory=tuple)
-    processed_idempotency_keys: frozenset[str] = field(default_factory=frozenset)
 
     def __post_init__(self) -> None:
         expected = self.compute_state_hash()
@@ -502,6 +507,8 @@ class HarnessSnapshot:
             "trajectory_id": self.trajectory_id,
             "epoch_id": self.epoch_id,
             "sequence": self.sequence,
+            "last_event_hash": self.last_event_hash,
+            "last_signature": self.last_signature,
             "candidates": [canonical_json(c) for c in self.candidates],
             "curated_items": [canonical_json(c) for c in self.curated_items],
             "claims": [canonical_json(c) for c in self.claims],
@@ -512,7 +519,6 @@ class HarnessSnapshot:
             "submissions": [canonical_json(c) for c in self.submissions],
             "tool_invocations": [canonical_json(c) for c in self.tool_invocations],
             "tool_results": [canonical_json(c) for c in self.tool_results],
-            "processed_idempotency_keys": sorted(self.processed_idempotency_keys),
         }
         return hash_content(canonical_json(payload))
 
@@ -532,15 +538,16 @@ class HarnessSnapshot:
         trajectory_id: TrajectoryId,
         epoch_id: str,
         sequence: int,
+        last_event_hash: ContentHash | None = None,
         **kwargs: Any,
     ) -> HarnessSnapshot:
         """Create a snapshot with a correctly computed state hash."""
-        # Build a transient instance using object.__new__ so we can compute the
-        # hash before final validation in __post_init__.
         fields = {
             "trajectory_id": trajectory_id,
             "epoch_id": epoch_id,
             "sequence": sequence,
+            "last_event_hash": last_event_hash,
+            "last_signature": kwargs.get("last_signature", None),
             "state_hash": "",
             "created_at": kwargs.get("created_at", utc_now()),
             "candidates": kwargs.get("candidates", ()),
@@ -553,7 +560,6 @@ class HarnessSnapshot:
             "submissions": kwargs.get("submissions", ()),
             "tool_invocations": kwargs.get("tool_invocations", ()),
             "tool_results": kwargs.get("tool_results", ()),
-            "processed_idempotency_keys": kwargs.get("processed_idempotency_keys", frozenset()),
         }
         transient = object.__new__(cls)
         for name, value in fields.items():

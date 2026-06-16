@@ -32,8 +32,9 @@ from rfsn_agent.events import (
     TaskDecomposedPayload,
     ToolInvokedPayload,
     ToolResultReceivedPayload,
+    payload_type_name,
 )
-from rfsn_agent.types import TaskStatus, ToolStatus
+from rfsn_agent.types import TaskStatus, ToolStatus, VerificationResult, VerificationStatus
 
 
 class ReducerError(ValueError):
@@ -51,14 +52,10 @@ def reduce_event(snapshot: HarnessSnapshot, event: HarnessEvent) -> HarnessSnaps
     """Return the next snapshot produced by applying ``event`` to ``snapshot``.
 
     The reducer is pure and deterministic: the same snapshot and event always
-    produce the same resulting snapshot. It validates envelope invariants,
-    idempotency, and event-specific preconditions before mutating state.
+    produce the same resulting snapshot. It validates envelope invariants and
+    event-specific preconditions before mutating state.
     """
     _validate_envelope(snapshot, event)
-
-    if event.idempotency_key in snapshot.processed_idempotency_keys:
-        # Idempotent replay: the event has already been applied.
-        return snapshot
 
     handler = _HANDLERS.get(event.event_type)
     if handler is None:
@@ -80,10 +77,41 @@ def _validate_envelope(snapshot: HarnessSnapshot, event: HarnessEvent) -> None:
             f"(current {CURRENT_EVENT_SCHEMA_VERSION})"
         )
 
-    if event.idempotency_key not in snapshot.processed_idempotency_keys:
-        if event.sequence != snapshot.sequence + 1:
+    expected_type = payload_type_name(event.payload)
+    if event.header.event_type != expected_type:
+        raise InvariantError(
+            f"Event type mismatch: header says {event.header.event_type!r}, "
+            f"payload is {expected_type!r}"
+        )
+
+    if event.sequence != snapshot.sequence + 1:
+        raise InvariantError(
+            f"Sequence gap: snapshot={snapshot.sequence}, event={event.sequence}"
+        )
+
+    if event.sequence == 1 and event.header.previous_event_hash is not None:
+        raise InvariantError("First event must not have a previous hash")
+
+    if event.sequence > 1 and event.header.previous_event_hash is None:
+        raise InvariantError("Non-genesis event requires a previous hash")
+
+    if event.header.previous_event_hash != snapshot.last_event_hash:
+        raise InvariantError(
+            "Event chain mismatch: expected previous hash "
+            f"{snapshot.last_event_hash}, received {event.header.previous_event_hash}"
+        )
+
+    # Signature chain validation. When any event in the trajectory is signed,
+    # the entire chain must be signed consistently.
+    if event.header.signature is not None or snapshot.last_signature is not None:
+        if event.sequence == 1 and event.header.previous_signature is not None:
+            raise InvariantError("First event must not have a previous signature")
+        if event.sequence > 1 and event.header.previous_signature is None:
+            raise InvariantError("Non-genesis event requires a previous signature")
+        if event.header.previous_signature != snapshot.last_signature:
             raise InvariantError(
-                f"Sequence gap: snapshot={snapshot.sequence}, event={event.sequence}"
+                "Signature chain mismatch: expected previous signature "
+                f"{snapshot.last_signature}, received {event.header.previous_signature}"
             )
 
 
@@ -111,11 +139,13 @@ def _next_snapshot(
     tool_invocations: tuple[ToolInvocation, ...] | None = None,
     tool_results: tuple[ToolResult, ...] | None = None,
 ) -> HarnessSnapshot:
-    """Build a new snapshot with updated idempotency and sequence state."""
+    """Build a new snapshot with updated sequence and chain hash."""
     return HarnessSnapshot.create(
         trajectory_id=snapshot.trajectory_id,
         epoch_id=epoch_id if epoch_id is not None else snapshot.epoch_id,
         sequence=event.sequence,
+        last_event_hash=event.header.event_hash,
+        last_signature=event.header.signature,
         created_at=event.header.created_at,
         candidates=candidates if candidates is not None else snapshot.candidates,
         curated_items=curated_items if curated_items is not None else snapshot.curated_items,
@@ -131,8 +161,6 @@ def _next_snapshot(
         if tool_invocations is not None
         else snapshot.tool_invocations,
         tool_results=tool_results if tool_results is not None else snapshot.tool_results,
-        processed_idempotency_keys=snapshot.processed_idempotency_keys
-        | {event.idempotency_key},
     )
 
 
@@ -263,15 +291,27 @@ def _handle_evidence_verified(
         snapshot.evidence_links, lambda link: link.link_id, payload.link_id
     )
     old_link = snapshot.evidence_links[link_index]
+    if old_link.trajectory_id != event.trajectory_id:
+        raise InvariantError(
+            f"Evidence link {payload.link_id} does not belong to trajectory {event.trajectory_id}"
+        )
+
+    record_ids = {r.record_id for r in snapshot.verification_records}
+    if payload.verification_id in record_ids:
+        raise InvariantError(f"Duplicate verification record id: {payload.verification_id}")
+
     record = VerificationRecord.create(
         record_id=payload.verification_id,
         trajectory_id=event.trajectory_id,
+        link_id=payload.link_id,
         claim_id=old_link.claim_id,
         method="event",
         result=payload.result,
         details=payload.details,
         provenance=_with_event_provenance(event),
     )
+
+    current_status = _verification_status_from_result(payload.result)
     updated_link = EvidenceLink(
         link_id=old_link.link_id,
         trajectory_id=old_link.trajectory_id,
@@ -279,7 +319,7 @@ def _handle_evidence_verified(
         curated_item_id=old_link.curated_item_id,
         relationship=old_link.relationship,
         strength=old_link.strength,
-        verified=True,
+        current_status=current_status,
         verification_id=payload.verification_id,
         created_at=old_link.created_at,
         provenance=old_link.provenance,
@@ -291,6 +331,14 @@ def _handle_evidence_verified(
         evidence_links=evidence_links,
         verification_records=snapshot.verification_records + (record,),
     )
+
+
+def _verification_status_from_result(result: VerificationResult) -> VerificationStatus:
+    if result == VerificationResult.CONFIRMED:
+        return VerificationStatus.VERIFIED
+    if result == VerificationResult.REFUTED:
+        return VerificationStatus.REFUTED
+    return VerificationStatus.INCONCLUSIVE
 
 
 def _handle_task_decomposed(
@@ -386,6 +434,11 @@ def _handle_snapshot_checkpointed(
     snapshot: HarnessSnapshot, event: HarnessEvent
 ) -> HarnessSnapshot:
     payload = _expect_payload_type(event.payload, SnapshotCheckpointedPayload)
+    if payload.snapshot_sequence != snapshot.sequence:
+        raise InvariantError(
+            f"Checkpoint sequence mismatch: event={payload.snapshot_sequence}, "
+            f"current={snapshot.sequence}"
+        )
     current_hash = snapshot.compute_state_hash()
     if payload.snapshot_hash != current_hash:
         raise InvariantError(

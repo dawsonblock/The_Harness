@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import uuid
 from typing import Protocol
 
 from rfsn_agent.actions import (
@@ -12,7 +13,8 @@ from rfsn_agent.actions import (
 )
 from rfsn_agent.context import CompilerConfig, ContextPacket, TokenCounter, compile_context
 from rfsn_agent.domain import HarnessSnapshot
-from rfsn_agent.store import SQLiteEventStore
+from rfsn_agent.store import SQLiteEventStore, StaleContextError
+from rfsn_agent.types import TrajectoryId
 
 
 class Policy(Protocol):
@@ -26,9 +28,9 @@ class Runtime:
     """Drives the action loop for a single trajectory.
 
     The runtime is deliberately thin: it compiles state into a context packet,
-    asks the policy for an action, validates it, converts it to events, and
-    appends those events to the store. All semantic state lives in the event
-    log and derived snapshots.
+    asks the policy for an action, validates it, converts it to proposed
+    events, and commits those events to the store. All semantic state lives in
+    the event log and derived snapshots.
     """
 
     def __init__(
@@ -53,8 +55,13 @@ class Runtime:
         """Validate and execute one action, returning the new snapshot."""
         snapshot = self.store.get_latest_snapshot(trajectory_id)
         validate_action(action, snapshot, token_cost_estimate=token_cost_estimate)
-        events = plan_events(action, snapshot, action_id=action_id, actor=actor)
-        self.store.append_events(events)
+        proposed = plan_events(action, snapshot, action_id=action_id, actor=actor)
+        self.store.commit_events(
+            trajectory_id=TrajectoryId(trajectory_id),
+            expected_sequence=snapshot.sequence,
+            expected_head_hash=snapshot.last_event_hash,
+            proposed_events=tuple(proposed),
+        )
         return self.store.get_latest_snapshot(trajectory_id)
 
     def step(
@@ -64,20 +71,35 @@ class Runtime:
         *,
         action_id: str | None = None,
         token_cost_estimate: int = 0,
+        max_retries: int = 3,
     ) -> HarnessSnapshot:
-        """Compile context, ask the policy for an action, and execute it."""
-        snapshot = self.store.get_latest_snapshot(trajectory_id)
-        context = compile_context(
-            snapshot, self.compiler_config, self.token_counter
-        )
-        action = policy(context, snapshot)
-        if action_id is None:
-            action_id = f"step-{snapshot.sequence}"
-        return self.execute(
-            trajectory_id,
-            action,
-            action_id=action_id,
-            token_cost_estimate=token_cost_estimate,
+        """Compile context, ask the policy for an action, and execute it.
+
+        If the trajectory head changes between context compilation and commit,
+        the step is retried with fresh context up to ``max_retries`` times.
+        """
+        for _ in range(max_retries):
+            snapshot = self.store.get_latest_snapshot(trajectory_id)
+            context = compile_context(
+                snapshot, self.compiler_config, self.token_counter
+            )
+            action = policy(context, snapshot)
+            if action_id is None:
+                action_id = f"step-{uuid.uuid4().hex}"
+            try:
+                validate_action(action, snapshot, token_cost_estimate=token_cost_estimate)
+                proposed = plan_events(action, snapshot, action_id=action_id, actor="policy")
+                self.store.commit_events(
+                    trajectory_id=TrajectoryId(trajectory_id),
+                    expected_sequence=snapshot.sequence,
+                    expected_head_hash=snapshot.last_event_hash,
+                    proposed_events=tuple(proposed),
+                )
+                return self.store.get_latest_snapshot(trajectory_id)
+            except StaleContextError:
+                continue
+        raise StaleContextError(
+            f"Could not commit step for {trajectory_id}: head changed too many times"
         )
 
     def run(
@@ -89,13 +111,14 @@ class Runtime:
         stop_on: tuple[type[Exception], ...] = (ActionError,),
     ) -> HarnessSnapshot:
         """Run the policy loop for up to ``max_steps`` iterations."""
+        run_id = uuid.uuid4().hex
         snapshot = self.store.get_latest_snapshot(trajectory_id)
         for step_idx in range(max_steps):
             try:
                 snapshot = self.step(
                     trajectory_id,
                     policy,
-                    action_id=f"run-{step_idx}",
+                    action_id=f"run-{run_id}-step-{step_idx}",
                 )
             except stop_on:
                 break

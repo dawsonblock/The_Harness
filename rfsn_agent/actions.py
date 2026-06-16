@@ -12,7 +12,7 @@ from rfsn_agent.events import (
     ContextPrunedPayload,
     EvidenceCuratedPayload,
     EvidenceVerifiedPayload,
-    HarnessEvent,
+    ProposedEvent,
     SubmissionRecordedPayload,
     TaskDecomposedPayload,
     ToolInvokedPayload,
@@ -20,7 +20,6 @@ from rfsn_agent.events import (
 from rfsn_agent.types import (
     ClaimId,
     ClaimStatus,
-    EventId,
     ItemId,
     LinkId,
     SubmissionId,
@@ -258,7 +257,7 @@ def _validate_preconditions(
 
 
 # ---------------------------------------------------------------------------
-# Action -> event planning
+# Action -> proposed event planning
 # ---------------------------------------------------------------------------
 
 
@@ -268,17 +267,18 @@ def plan_events(
     *,
     action_id: str,
     actor: str = "policy",
-) -> list[HarnessEvent]:
-    """Convert a validated action into one or more harness events."""
-    sequence = snapshot.sequence + 1
-    events: list[HarnessEvent] = []
+) -> list[ProposedEvent]:
+    """Convert a validated action into one or more proposed events.
+
+    The returned events are semantic proposals: they do not carry sequence
+    numbers, timestamps, physical event ids, or hash-chain metadata. The
+    transactional store assigns those fields during commit.
+    """
+    events: list[ProposedEvent] = []
 
     if isinstance(action, DecomposeAction):
         events.append(
-            HarnessEvent.create(
-                event_id=EventId(f"evt-{action_id}"),
-                trajectory_id=snapshot.trajectory_id,
-                sequence=sequence,
+            ProposedEvent(
                 event_type="task_decomposed",
                 payload=TaskDecomposedPayload(
                     parent_task_id=TaskId(action.parent_task_id)
@@ -296,10 +296,7 @@ def plan_events(
 
     elif isinstance(action, SearchAction):
         events.append(
-            HarnessEvent.create(
-                event_id=EventId(f"evt-{action_id}"),
-                trajectory_id=snapshot.trajectory_id,
-                sequence=sequence,
+            ProposedEvent(
                 event_type="tool_invoked",
                 payload=ToolInvokedPayload(
                     invocation_id=ToolInvocationId(f"tool-{action_id}"),
@@ -317,10 +314,7 @@ def plan_events(
 
     elif isinstance(action, ReadAction):
         events.append(
-            HarnessEvent.create(
-                event_id=EventId(f"evt-{action_id}"),
-                trajectory_id=snapshot.trajectory_id,
-                sequence=sequence,
+            ProposedEvent(
                 event_type="tool_invoked",
                 payload=ToolInvokedPayload(
                     invocation_id=ToolInvocationId(f"tool-{action_id}"),
@@ -338,10 +332,7 @@ def plan_events(
 
     elif isinstance(action, CurateAction):
         events.append(
-            HarnessEvent.create(
-                event_id=EventId(f"evt-{action_id}"),
-                trajectory_id=snapshot.trajectory_id,
-                sequence=sequence,
+            ProposedEvent(
                 event_type="evidence_curated",
                 payload=EvidenceCuratedPayload(
                     candidate_ids=tuple(ItemId(c) for c in action.candidate_ids),
@@ -358,10 +349,7 @@ def plan_events(
 
     elif isinstance(action, DiscardAction):
         events.append(
-            HarnessEvent.create(
-                event_id=EventId(f"evt-{action_id}"),
-                trajectory_id=snapshot.trajectory_id,
-                sequence=sequence,
+            ProposedEvent(
                 event_type="action_committed",
                 payload=ActionCommittedPayload(
                     action_type="discard",
@@ -378,10 +366,7 @@ def plan_events(
 
     elif isinstance(action, VerifyAction):
         events.append(
-            HarnessEvent.create(
-                event_id=EventId(f"evt-{action_id}"),
-                trajectory_id=snapshot.trajectory_id,
-                sequence=sequence,
+            ProposedEvent(
                 event_type="evidence_verified",
                 payload=EvidenceVerifiedPayload(
                     link_id=LinkId(action.link_id),
@@ -397,10 +382,7 @@ def plan_events(
 
     elif isinstance(action, ReviseClaimAction):
         events.append(
-            HarnessEvent.create(
-                event_id=EventId(f"evt-{action_id}"),
-                trajectory_id=snapshot.trajectory_id,
-                sequence=sequence,
+            ProposedEvent(
                 event_type="claim_revised",
                 payload=ClaimRevisedPayload(
                     claim_id=ClaimId(action.claim_id),
@@ -415,10 +397,7 @@ def plan_events(
 
     elif isinstance(action, PruneSemanticAction):
         events.append(
-            HarnessEvent.create(
-                event_id=EventId(f"evt-{action_id}"),
-                trajectory_id=snapshot.trajectory_id,
-                sequence=sequence,
+            ProposedEvent(
                 event_type="context_pruned",
                 payload=ContextPrunedPayload(
                     retained_item_ids=tuple(ItemId(i) for i in action.retained_item_ids),
@@ -432,10 +411,7 @@ def plan_events(
 
     elif isinstance(action, RequestContextAction):
         events.append(
-            HarnessEvent.create(
-                event_id=EventId(f"evt-{action_id}"),
-                trajectory_id=snapshot.trajectory_id,
-                sequence=sequence,
+            ProposedEvent(
                 event_type="action_committed",
                 payload=ActionCommittedPayload(
                     action_type="request_context",
@@ -452,10 +428,7 @@ def plan_events(
 
     elif isinstance(action, SubmitAction):
         events.append(
-            HarnessEvent.create(
-                event_id=EventId(f"evt-{action_id}"),
-                trajectory_id=snapshot.trajectory_id,
-                sequence=sequence,
+            ProposedEvent(
                 event_type="submission_recorded",
                 payload=SubmissionRecordedPayload(
                     submission_id=SubmissionId(action.submission_id),
