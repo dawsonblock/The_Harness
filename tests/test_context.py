@@ -10,6 +10,7 @@ from rfsn_agent.context import (
     ContextPacket,
     ContextSegment,
     DefaultContextSelector,
+    HuggingFaceTokenizerCounter,
     JinjaContextRenderer,
     TrustedRole,
     WhitespaceTokenCounter,
@@ -425,6 +426,48 @@ def test_default_context_selector_matches_old_collect_segments() -> None:
 
     assert [s.segment_id for s in selected] == [s.segment_id for s in packet.segments]
     assert sum(s.token_count for s in selected) == packet.total_tokens
+
+
+def test_huggingface_tokenizer_counter_uses_injected_tokenizer() -> None:
+    def fake_tokenizer(text: str) -> dict[str, list[int]]:
+        return {"input_ids": list(range(len(text)))}
+
+    counter = HuggingFaceTokenizerCounter(tokenizer=fake_tokenizer)
+    assert counter.count("abc") == 3
+    assert counter.count("") == 0
+
+
+def test_huggingface_tokenizer_counter_falls_back_when_tokenizer_raises() -> None:
+    def failing_tokenizer(text: str) -> dict[str, list[int]]:
+        raise RuntimeError("tokenizer unavailable")
+
+    counter = HuggingFaceTokenizerCounter(tokenizer=failing_tokenizer)
+    assert counter.count("three tokens here") == 3
+
+
+def test_compile_context_uses_injected_tokenizer() -> None:
+    def fake_tokenizer(text: str) -> dict[str, list[int]]:
+        # Every word maps to exactly two tokens.
+        return {"input_ids": list(range(len(text.split()) * 2))}
+
+    snap = _snapshot(
+        tasks=(
+            TaskNode(
+                task_id="task-1",
+                trajectory_id="traj-1",
+                parent_id=None,
+                description="one task",
+                status=TaskStatus.IN_PROGRESS,
+            ),
+        ),
+    )
+    packet = compile_context(
+        snap,
+        CompilerConfig(max_total_tokens=1000),
+        token_counter=HuggingFaceTokenizerCounter(tokenizer=fake_tokenizer),
+    )
+    assert packet.total_tokens == sum(len(s.content.split()) * 2 for s in packet.segments)
+    assert all(s.token_count == len(s.content.split()) * 2 for s in packet.segments)
 
 
 def test_jinja_context_renderer_llama3() -> None:

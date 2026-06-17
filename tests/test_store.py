@@ -958,3 +958,67 @@ def test_cas_offloading_large_payload() -> None:
         assert store.cas.exists(h) is True
         assert store.cas.get_text(h) == large_content
         conn.close()
+
+
+def test_cas_offloading_deeply_nested_payload_is_iterative() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        cas_dir = Path(tmp) / "cas"
+        store = SQLiteEventStore(Path(tmp) / "events.db", cas_base_dir=cas_dir)
+        store.init_trajectory("traj-1")
+        snap0 = store.get_latest_snapshot("traj-1")
+
+        payload: dict[str, object] = {"value": "leaf"}
+        for _ in range(300):
+            payload = {"child": payload}
+
+        prop = ProposedEvent(
+            event_type="submission_recorded",
+            payload=SubmissionRecordedPayload(
+                submission_id="sub-deep",
+                content=json.dumps(payload),
+                source_ids=("src-deep",),
+            ),
+            idempotency_key="idem-deep",
+            actor="policy",
+            action_id="act-deep",
+        )
+        store.commit_events(
+            trajectory_id="traj-1",
+            expected_sequence=snap0.sequence,
+            expected_head_hash=snap0.last_event_hash,
+            proposed_events=(prop,),
+        )
+
+        events = store.get_events("traj-1")
+        assert len(events) == 1
+        payload_obj = events[0].payload
+        assert isinstance(payload_obj, SubmissionRecordedPayload)
+        assert '"value": "leaf"' in payload_obj.content
+
+
+def test_snapshot_cache_invalidates_after_commit() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        store = SQLiteEventStore(Path(tmp) / "events.db")
+        store.init_trajectory("traj-1")
+        snap0 = store.get_latest_snapshot("traj-1")
+        snap_cached = store.get_latest_snapshot("traj-1")
+        assert snap_cached.sequence == 0
+        assert snap_cached is snap0
+
+        store.commit_events(
+            trajectory_id="traj-1",
+            expected_sequence=snap0.sequence,
+            expected_head_hash=snap0.last_event_hash,
+            proposed_events=(
+                ProposedEvent(
+                    event_type="action_committed",
+                    payload=_committed_payload(),
+                    idempotency_key="idem-cache",
+                    actor="policy",
+                    action_id="act-cache",
+                ),
+            ),
+        )
+        snap1 = store.get_latest_snapshot("traj-1")
+        assert snap1.sequence == 1
+        assert snap1 is not snap0

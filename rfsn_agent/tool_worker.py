@@ -119,7 +119,7 @@ class ToolWorker:
         # Re-read snapshot: another worker may have committed results
         # while we were executing tools.
         snapshot = await asyncio.to_thread(
-            self.store.get_latest_snapshot, trajectory_id
+            self.store._get_latest_snapshot_thread_safe, trajectory_id
         )
         completed = {r.invocation_id for r in snapshot.tool_results}
 
@@ -176,7 +176,7 @@ class ToolWorker:
 
         # Re-read snapshot to avoid stale state.
         snapshot = await asyncio.to_thread(
-            self.store.get_latest_snapshot, trajectory_id
+            self.store._get_latest_snapshot_thread_safe, trajectory_id
         )
         invocation = next(
             (t for t in snapshot.tool_invocations if t.invocation_id == invocation_id),
