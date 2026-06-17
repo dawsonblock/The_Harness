@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum, auto
 from typing import Any, Protocol
@@ -37,11 +38,12 @@ class WhitespaceTokenCounter:
 class TiktokenTokenCounter:
     """Token counter backed by tiktoken, falling back to whitespace counting."""
 
-    def __init__(self) -> None:
+    def __init__(self, encoding_name: str = "cl100k_base") -> None:
+        self.encoding_name = encoding_name
         try:
             import tiktoken  # type: ignore[import-not-found]
 
-            self._encoding = tiktoken.get_encoding("cl100k_base")
+            self._encoding = tiktoken.get_encoding(encoding_name)
         except Exception:
             self._encoding = None
 
@@ -49,6 +51,42 @@ class TiktokenTokenCounter:
         if self._encoding is None:
             return len(text.split())
         return len(self._encoding.encode(text))
+
+
+class HuggingFaceTokenizerCounter:
+    """Token counter backed by an injected HuggingFace tokenizer.
+
+    The tokenizer may be a HuggingFace ``PreTrainedTokenizerBase`` or any object
+    with a compatible ``__call__(text, add_special_tokens=False)`` interface.
+    If the tokenizer is unavailable or raises, counting falls back to whitespace.
+    """
+
+    def __init__(
+        self,
+        tokenizer: Callable[[str], Any] | None = None,
+        model_name: str | None = None,
+    ) -> None:
+        self.model_name = model_name
+        if tokenizer is not None:
+            self._tokenizer = tokenizer
+            return
+        if model_name is None:
+            self._tokenizer = None
+            return
+        try:
+            from transformers import AutoTokenizer  # type: ignore[import-not-found]
+
+            self._tokenizer = AutoTokenizer.from_pretrained(model_name)
+        except Exception:
+            self._tokenizer = None
+
+    def count(self, text: str) -> int:
+        if self._tokenizer is None:
+            return len(text.split())
+        try:
+            return len(self._tokenizer(text, add_special_tokens=False)["input_ids"])
+        except Exception:
+            return len(text.split())
 
 
 class TrustedRole(Enum):

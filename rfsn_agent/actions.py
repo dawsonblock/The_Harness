@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
+from os import path as os_path
+from pathlib import Path
+from re import Pattern
 
 from rfsn_agent.domain import HarnessSnapshot
 from rfsn_agent.events import (
@@ -173,21 +175,43 @@ def validate_action(
     snapshot: HarnessSnapshot,
     *,
     allowed_tool_names: set[str] | frozenset[str] | None = None,
-    forbidden_path_pattern: re.Pattern[str] | None = None,
+    allowed_workspace_root: str | Path | None = None,
+    forbidden_path_pattern: Pattern[str] | None = None,
     token_cost_estimate: int = 0,
 ) -> None:
     """Validate an action against safety, budget, and state preconditions."""
-    _validate_safety(action, forbidden_path_pattern=forbidden_path_pattern)
+    _validate_safety(
+        action,
+        allowed_workspace_root=allowed_workspace_root,
+        forbidden_path_pattern=forbidden_path_pattern,
+    )
     _validate_budget(action, snapshot, token_cost_estimate=token_cost_estimate)
     _validate_preconditions(action, snapshot, allowed_tool_names=allowed_tool_names)
+
+
+def _path_in_jail(path: str, root: str | Path) -> bool:
+    """Return True if ``path`` resolves inside ``root`` after symlink expansion."""
+    try:
+        resolved_root = Path(root).expanduser().resolve()
+        resolved_path = Path(path).expanduser().resolve()
+        return os_path.commonpath(
+            [str(resolved_root), str(resolved_path)]
+        ) == str(resolved_root)
+    except (FileNotFoundError, RuntimeError, ValueError):
+        return False
 
 
 def _validate_safety(
     action: Action,
     *,
-    forbidden_path_pattern: re.Pattern[str] | None = None,
+    allowed_workspace_root: str | Path | None = None,
+    forbidden_path_pattern: Pattern[str] | None = None,
 ) -> None:
     if isinstance(action, ReadAction):
+        if allowed_workspace_root is not None and not _path_in_jail(
+            action.source_id, allowed_workspace_root
+        ):
+            raise SafetyError(f"Read target outside workspace: {action.source_id}")
         if forbidden_path_pattern and forbidden_path_pattern.search(action.source_id):
             raise SafetyError(
                 f"Read target matches forbidden path pattern: {action.source_id}"

@@ -81,7 +81,11 @@ class ToolWorker:
         Returns the number of results committed.
         """
         count = 0
-        trajectories = [trajectory_id] if trajectory_id else self.store.list_trajectories()
+        trajectories = (
+            [trajectory_id]
+            if trajectory_id is not None
+            else await asyncio.to_thread(self.store.list_trajectories)
+        )
         for tid in trajectories:
             count += await self._process_trajectory(tid)
         return count
@@ -99,7 +103,9 @@ class ToolWorker:
             await asyncio.sleep(interval)
 
     async def _process_trajectory(self, trajectory_id: str) -> int:
-        snapshot = self.store.get_latest_snapshot(trajectory_id)
+        snapshot = await asyncio.to_thread(
+            self.store._get_latest_snapshot_thread_safe, trajectory_id
+        )
         pending = self._find_pending_invocations(snapshot)
         if not pending:
             return 0
@@ -112,7 +118,9 @@ class ToolWorker:
 
         # Re-read snapshot: another worker may have committed results
         # while we were executing tools.
-        snapshot = self.store.get_latest_snapshot(trajectory_id)
+        snapshot = await asyncio.to_thread(
+            self.store.get_latest_snapshot, trajectory_id
+        )
         completed = {r.invocation_id for r in snapshot.tool_results}
 
         # Filter proposals whose invocation is still uncommitted.
@@ -128,7 +136,8 @@ class ToolWorker:
                     completed.add(payload.invocation_id)
 
         if valid_proposals:
-            self._commit_results(
+            await asyncio.to_thread(
+                self._commit_results,
                 trajectory_id,
                 snapshot.sequence,
                 snapshot.last_event_hash,
@@ -166,7 +175,9 @@ class ToolWorker:
             self._lease_owners[invocation_id] = current
 
         # Re-read snapshot to avoid stale state.
-        snapshot = self.store.get_latest_snapshot(trajectory_id)
+        snapshot = await asyncio.to_thread(
+            self.store.get_latest_snapshot, trajectory_id
+        )
         invocation = next(
             (t for t in snapshot.tool_invocations if t.invocation_id == invocation_id),
             None,
@@ -179,20 +190,24 @@ class ToolWorker:
             return None
 
         # Security: tool must be in allow-list.
-        if self.security is not None and not self.security.is_tool_allowed(invocation.tool_name):
+        if self.security is not None and not self.security.is_tool_allowed(
+            invocation.tool_name
+        ):
             return self._make_result(
-                invocation_id, "failure",
-                f"Tool '{invocation.tool_name}' not allowed by security profile"
+                invocation_id,
+                "failure",
+                f"Tool '{invocation.tool_name}' not allowed by security profile",
             )
 
-        # Security: read_file paths must not match forbidden pattern.
+        # Security: read_file paths must be inside the allowed workspace jail.
         if invocation.tool_name == "read_file" and self.security is not None:
             args_dict = dict(invocation.arguments)
             path = args_dict.get("source_id") or args_dict.get("path", "")
             if not self.security.is_path_allowed(path):
                 return self._make_result(
-                    invocation_id, "failure",
-                    f"Path '{path}' matches forbidden path pattern"
+                    invocation_id,
+                    "failure",
+                    f"Path '{path}' is outside the allowed workspace",
                 )
 
         # Dependency check: only run if all dependencies succeeded.
@@ -233,9 +248,9 @@ class ToolWorker:
             args_dict = dict(arguments)
             path = args_dict.get("source_id") or args_dict.get("path", "")
             target = Path(path)
-            if not target.exists():
+            if not await asyncio.to_thread(target.exists):
                 raise ToolExecutionError(f"File not found: {path}")
-            return target.read_text(encoding="utf-8")
+            return await asyncio.to_thread(target.read_text, encoding="utf-8")
 
         raise ToolExecutionError(f"Unknown tool: {tool_name}")
 

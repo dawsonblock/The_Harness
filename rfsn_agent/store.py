@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from rfsn_agent.cas import ContentAddressedStore
 from rfsn_agent.common import canonical_json, hash_content, utc_now
@@ -108,7 +109,8 @@ class SQLiteEventStore:
         )
         self.signing_key = signing_key
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn: sqlite3.Connection | None = None
+        self._thread_local = threading.local()
+        self._snapshot_cache: dict[tuple[str, int | None], HarnessSnapshot] = {}
         self._ensure_schema()
 
     # ------------------------------------------------------------------
@@ -126,15 +128,86 @@ class SQLiteEventStore:
         conn.execute("PRAGMA foreign_keys=ON")
         return conn
 
+    def _invalidate_snapshot_cache(self, trajectory_id: str) -> None:
+        """Invalidate cached snapshots for a trajectory after mutations."""
+        for key in list(self._snapshot_cache):
+            if key[0] == trajectory_id:
+                del self._snapshot_cache[key]
+
     def _cursor(self) -> sqlite3.Cursor:
-        if self._conn is None:
-            self._conn = self._connect()
-        return self._conn.cursor()
+        conn = getattr(self._thread_local, "conn", None)
+        if conn is None:
+            conn = self._connect()
+            self._thread_local.conn = conn
+        return conn.cursor()
+
+    def _execute_in_thread_safe_connection(
+        self, func: Callable[[sqlite3.Connection], Any]
+    ) -> Any:
+        """Run a SQLite operation in a fresh connection for async/threaded callers.
+
+        The public store API is synchronous and may be used from one owning
+        thread. Async callers such as ``ToolWorker`` use ``to_thread`` and can
+        hit SQLite's thread affinity if they reuse ``_cursor``. This helper
+        avoids that by opening a short-lived connection for the operation while
+        leaving the normal connection cache unchanged.
+        """
+        with self._connect() as conn:
+            return func(conn)
+
+    def _get_latest_snapshot_thread_safe(self, trajectory_id: str) -> HarnessSnapshot:
+        """Thread-safe latest snapshot path for async callers."""
+        cache_key = (trajectory_id, None)
+        cached = self._snapshot_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        def _load(conn: sqlite3.Connection) -> HarnessSnapshot:
+            cur = conn.cursor()
+            row = cur.execute(
+                "SELECT * FROM trajectories WHERE trajectory_id = ?",
+                (trajectory_id,),
+            ).fetchone()
+            if row is None:
+                raise StoreError(f"Trajectory not found: {trajectory_id}")
+            checkpoint_sql = """
+                SELECT snapshot_json FROM harness_snapshots
+                WHERE trajectory_id = ? ORDER BY sequence DESC LIMIT 1
+            """
+            row = cur.execute(checkpoint_sql, (trajectory_id,)).fetchone()
+            if row is None:
+                raise StoreError(
+                    f"No snapshot checkpoint found for trajectory: {trajectory_id}"
+                )
+            snapshot = HarnessSnapshot.from_dict(json.loads(row["snapshot_json"]))
+
+            event_sql = """
+                SELECT
+                    event_id, trajectory_id, sequence, event_type, schema_version,
+                    idempotency_key, parent_event_id, created_at, actor, action_id,
+                    payload_hash, previous_event_hash, event_hash,
+                    previous_signature, signature, payload_json
+                FROM harness_events
+                WHERE trajectory_id = ? AND sequence > ?
+                ORDER BY sequence
+            """
+            event_rows = cur.execute(
+                event_sql, (trajectory_id, snapshot.sequence)
+            ).fetchall()
+            for event_row in event_rows:
+                event = _event_from_row(event_row, self.signing_key, self.cas)
+                snapshot = reduce_event(snapshot, event)
+            return snapshot
+
+        snapshot = self._execute_in_thread_safe_connection(_load)
+        self._snapshot_cache[cache_key] = snapshot
+        return snapshot
 
     def close(self) -> None:
-        if self._conn is not None:
-            self._conn.close()
-            self._conn = None
+        conn = getattr(self._thread_local, "conn", None)
+        if conn is not None:
+            conn.close()
+            self._thread_local.conn = None
 
     def __enter__(self) -> SQLiteEventStore:
         return self
@@ -335,6 +408,7 @@ class SQLiteEventStore:
                 _insert_snapshot(cur, head, event_count)
 
             cur.execute("COMMIT")
+            self._invalidate_snapshot_cache(trajectory_id)
         except (StaleContextError, IdempotencyConflictError):
             cur.execute("ROLLBACK")
             raise
@@ -525,8 +599,14 @@ class SQLiteEventStore:
         return snapshot
 
     def get_latest_snapshot(self, trajectory_id: str) -> HarnessSnapshot:
-        """Return the latest snapshot by replaying the full event log."""
-        return self.replay(trajectory_id)
+        """Return the latest snapshot, using an in-memory head cache when safe."""
+        cache_key = (trajectory_id, None)
+        cached = self._snapshot_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        snapshot = self.replay(trajectory_id)
+        self._snapshot_cache[cache_key] = snapshot
+        return snapshot
 
     def save_snapshot(self, snapshot: HarnessSnapshot, event_count: int) -> None:
         """Persist a snapshot checkpoint for fast recovery."""
@@ -1247,29 +1327,87 @@ def _event_from_row(
 
 
 def _maybe_offload_to_cas(obj: Any, cas: ContentAddressedStore | None) -> Any:
+    """Offload large strings to CAS using iterative traversal.
+
+    This avoids recursion errors for deeply nested payloads while preserving the
+    ``{"__cas_ref__": hash}`` marker contract used by CAS-backed events.
+    """
     if cas is None:
         return obj
-    if isinstance(obj, str):
-        if len(obj) > 4096:
-            return {"__cas_ref__": cas.put(obj)}
-        return obj
-    if isinstance(obj, list):
-        return [_maybe_offload_to_cas(item, cas) for item in obj]
-    if isinstance(obj, dict):
-        return {k: _maybe_offload_to_cas(v, cas) for k, v in obj.items()}
-    return obj
+
+    root: Any = obj
+    stack: list[tuple[Any, tuple[Any, ...] | None, str | None]] = [(obj, None, None)]
+
+    while stack:
+        current, parent_items, key_in_parent = stack.pop()
+
+        if isinstance(current, str):
+            replacement: Any = (
+                {"__cas_ref__": cas.put(current)} if len(current) > 4096 else current
+            )
+            if parent_items is not None and key_in_parent is not None:
+                container, parent_key = parent_items, key_in_parent
+                if isinstance(container, list):
+                    container[int(parent_key)] = replacement
+                elif isinstance(container, dict):
+                    container[parent_key] = replacement
+            else:
+                root = replacement
+            continue
+
+        if isinstance(current, list):
+            stack.append((current, None, None))
+            for idx in range(len(current) - 1, -1, -1):
+                stack.append((current[idx], (current, None), str(idx)))
+            continue
+
+        if isinstance(current, dict):
+            stack.append((current, None, None))
+            for dict_key, value in reversed(list(current.items())):
+                stack.append((value, (current, dict_key), None))
+            continue
+
+    return root
 
 
 def _maybe_resolve_from_cas(obj: Any, cas: ContentAddressedStore | None) -> Any:
-    if isinstance(obj, list):
-        return [_maybe_resolve_from_cas(item, cas) for item in obj]
-    if isinstance(obj, dict):
-        if set(obj.keys()) == {"__cas_ref__"} and isinstance(obj["__cas_ref__"], str):
-            if cas is None:
-                raise StoreError("CAS reference found but CAS is not configured")
-            return cas.get_text(obj["__cas_ref__"])
-        return {k: _maybe_resolve_from_cas(v, cas) for k, v in obj.items()}
-    return obj
+    """Resolve CAS markers using iterative traversal."""
+    if cas is None:
+        return obj
+
+    root: Any = obj
+    stack: list[tuple[Any, tuple[Any, ...] | None, str | None]] = [(obj, None, None)]
+
+    while stack:
+        current, parent_items, key_in_parent = stack.pop()
+
+        if isinstance(current, list):
+            stack.append((current, None, None))
+            for idx in range(len(current) - 1, -1, -1):
+                stack.append((current[idx], (current, None), str(idx)))
+            continue
+
+        if isinstance(current, dict):
+            if set(current.keys()) == {"__cas_ref__"} and isinstance(
+                current["__cas_ref__"], str
+            ):
+                replacement = cas.get_text(current["__cas_ref__"])
+                if parent_items is not None and key_in_parent is not None:
+                    container, parent_key = parent_items, key_in_parent
+                    if isinstance(container, list):
+                        container[int(parent_key)] = replacement
+                    elif isinstance(container, dict):
+                        container[parent_key] = replacement
+                else:
+                    root = replacement
+                continue
+
+            stack.append((current, None, None))
+            for dict_key, value in reversed(list(current.items())):
+                stack.append((value, (current, dict_key), None))
+            continue
+
+    return root
 
 
 def _payload_to_dict(payload: Any) -> dict[str, Any]:

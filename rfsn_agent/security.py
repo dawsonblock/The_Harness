@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from os import path as os_path
+from pathlib import Path
 from re import Pattern
 
 
@@ -24,6 +26,7 @@ class SecurityProfile:
     """
 
     allowed_tool_names: frozenset[str] = frozenset()
+    allowed_workspace_root: Path | None = None
     forbidden_path_pattern: Pattern[str] | None = None
     max_tool_timeout_seconds: float = 30.0
 
@@ -35,7 +38,20 @@ class SecurityProfile:
         return tool_name in self.allowed_tool_names
 
     def is_path_allowed(self, path: str) -> bool:
-        """Return True if ``path`` does not match the forbidden pattern."""
+        """Return True if ``path`` is inside the allowed workspace jail.
+
+        When ``allowed_workspace_root`` is unset, the legacy regex guard is
+        still applied for backwards compatibility. When a workspace root is
+        configured, paths are expanded, resolved through symlinks, and rejected
+        if they escape the root. The optional regex remains an additional
+        deny-list after path jail validation.
+        """
+        if self.allowed_workspace_root is not None:
+            root = self.allowed_workspace_root.expanduser().resolve()
+            target = Path(path).expanduser().resolve()
+            if os_path.commonpath([str(root), str(target)]) != str(root):
+                return False
+
         if self.forbidden_path_pattern is None:
             return True
         return self.forbidden_path_pattern.search(path) is None

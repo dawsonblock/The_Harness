@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import tempfile
 from pathlib import Path
 
@@ -114,7 +115,57 @@ async def test_tool_worker_respects_forbidden_path() -> None:
 
         snap = store.get_latest_snapshot("traj-1")
         assert snap.tool_results[0].status.value == "failure"
-        assert "forbidden path" in snap.tool_results[0].content
+        assert "outside" in snap.tool_results[0].content
+
+
+@pytest.mark.anyio
+async def test_tool_worker_enforces_workspace_jail() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        store = _init_store(tmp)
+        root = Path(tmp)
+        outside = Path(tmp).parent / "secret.txt"
+        await _commit_tool_invoked(
+            store, "tool-1", "read_file", (("source_id", str(outside)),)
+        )
+
+        profile = SecurityProfile(
+            allowed_tool_names=frozenset({"read_file"}),
+            allowed_workspace_root=root,
+        )
+        worker = ToolWorker(store, security_profile=profile)
+        count = await worker.process_pending("traj-1")
+        assert count == 1
+
+        snap = store.get_latest_snapshot("traj-1")
+        assert snap.tool_results[0].status.value == "failure"
+        assert "outside" in snap.tool_results[0].content
+
+
+@pytest.mark.anyio
+async def test_tool_worker_blocks_symlink_escape() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        store = _init_store(tmp)
+        root = Path(tmp) / "workspace"
+        root.mkdir()
+        outside = Path(tmp) / "secret.txt"
+        outside.write_text("secret")
+        link = root / "link.txt"
+        os.symlink(outside, link)
+        await _commit_tool_invoked(
+            store, "tool-1", "read_file", (("source_id", str(link)),)
+        )
+
+        profile = SecurityProfile(
+            allowed_tool_names=frozenset({"read_file"}),
+            allowed_workspace_root=root,
+        )
+        worker = ToolWorker(store, security_profile=profile)
+        count = await worker.process_pending("traj-1")
+        assert count == 1
+
+        snap = store.get_latest_snapshot("traj-1")
+        assert snap.tool_results[0].status.value == "failure"
+        assert "outside" in snap.tool_results[0].content
 
 
 @pytest.mark.anyio

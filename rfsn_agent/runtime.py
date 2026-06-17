@@ -66,6 +66,11 @@ class Runtime:
                 if self.security_profile is not None
                 else None
             ),
+            allowed_workspace_root=(
+                self.security_profile.allowed_workspace_root
+                if self.security_profile is not None
+                else None
+            ),
             forbidden_path_pattern=(
                 self.security_profile.forbidden_path_pattern
                 if self.security_profile is not None
@@ -110,6 +115,11 @@ class Runtime:
                     token_cost_estimate=token_cost_estimate,
                     allowed_tool_names=(
                         self.security_profile.allowed_tool_names
+                        if self.security_profile is not None
+                        else None
+                    ),
+                    allowed_workspace_root=(
+                        self.security_profile.allowed_workspace_root
                         if self.security_profile is not None
                         else None
                     ),
