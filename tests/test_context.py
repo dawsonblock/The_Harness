@@ -12,6 +12,7 @@ from rfsn_agent.context import (
     DefaultContextSelector,
     HuggingFaceTokenizerCounter,
     JinjaContextRenderer,
+    TokenFallbackPolicy,
     TrustedRole,
     WhitespaceTokenCounter,
     compile_context,
@@ -437,12 +438,62 @@ def test_huggingface_tokenizer_counter_uses_injected_tokenizer() -> None:
     assert counter.count("") == 0
 
 
-def test_huggingface_tokenizer_counter_falls_back_when_tokenizer_raises() -> None:
+def test_huggingface_tokenizer_counter_raises_on_failure() -> None:
     def failing_tokenizer(text: str, **_: object) -> dict[str, list[int]]:
         raise RuntimeError("tokenizer unavailable")
 
     counter = HuggingFaceTokenizerCounter(tokenizer=failing_tokenizer)
-    assert counter.count("three tokens here") == 3
+    with pytest.raises(RuntimeError):
+        counter.count("three tokens here")
+
+
+def test_compile_context_falls_back_to_whitespace_by_default() -> None:
+    def failing_tokenizer(text: str, **_: object) -> dict[str, list[int]]:
+        raise RuntimeError("tokenizer unavailable")
+
+    snap = _snapshot(
+        tasks=(
+            TaskNode(
+                task_id="task-1",
+                trajectory_id="traj-1",
+                parent_id=None,
+                description="one task",
+                status=TaskStatus.IN_PROGRESS,
+            ),
+        ),
+    )
+    packet = compile_context(
+        snap,
+        CompilerConfig(max_total_tokens=1000),
+        token_counter=HuggingFaceTokenizerCounter(tokenizer=failing_tokenizer),
+    )
+    assert packet.total_tokens == sum(len(s.content.split()) for s in packet.segments)
+
+
+def test_compile_context_strict_fallback_raises() -> None:
+    def failing_tokenizer(text: str, **_: object) -> dict[str, list[int]]:
+        raise RuntimeError("tokenizer unavailable")
+
+    snap = _snapshot(
+        tasks=(
+            TaskNode(
+                task_id="task-1",
+                trajectory_id="traj-1",
+                parent_id=None,
+                description="one task",
+                status=TaskStatus.IN_PROGRESS,
+            ),
+        ),
+    )
+    with pytest.raises(RuntimeError):
+        compile_context(
+            snap,
+            CompilerConfig(
+                max_total_tokens=1000,
+                token_fallback_policy=TokenFallbackPolicy.STRICT,
+            ),
+            token_counter=HuggingFaceTokenizerCounter(tokenizer=failing_tokenizer),
+        )
 
 
 def test_compile_context_uses_injected_tokenizer() -> None:

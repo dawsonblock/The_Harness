@@ -42,8 +42,56 @@ class WhitespaceTokenCounter:
         return len(text.split())
 
 
+class TokenFallbackPolicy(Enum):
+    """Fallback behavior when a model tokenizer is unavailable."""
+
+    WHITESPACE = auto()
+    STRICT = auto()
+
+
+def _token_counter_with_policy(
+    counter: TokenCounter,
+    *,
+    fallback_policy: TokenFallbackPolicy,
+    fallback: TokenCounter | None = None,
+) -> TokenCounter:
+    """Return a counter that either falls back or raises on tokenizer failure.
+
+    The wrapped counter is expected to raise when its tokenizer is unavailable.
+    This helper centralizes fallback policy without changing token counts.
+    """
+
+    class _PolicyCounter:
+        def __init__(
+            self,
+            counter: TokenCounter,
+            fallback: TokenCounter,
+            policy: TokenFallbackPolicy,
+        ) -> None:
+            self._counter = counter
+            self._fallback = fallback
+            self._policy = policy
+
+        def count(self, text: str) -> int:
+            try:
+                return self._counter.count(text)
+            except Exception as exc:
+                if self._policy is TokenFallbackPolicy.WHITESPACE:
+                    return self._fallback.count(text)
+                raise RuntimeError(
+                    "Tokenizer unavailable and fallback policy is strict"
+                ) from exc
+
+    return _PolicyCounter(counter, fallback or WhitespaceTokenCounter(), fallback_policy)
+
+
 class TiktokenTokenCounter:
-    """Token counter backed by tiktoken, falling back to whitespace counting."""
+    """Token counter backed by tiktoken.
+
+    By default the compiler can fall back to whitespace counting when tiktoken is
+    unavailable. Set ``CompilerConfig.token_fallback_policy`` to
+    ``TokenFallbackPolicy.STRICT`` when tokenizer availability must be enforced.
+    """
 
     def __init__(self, encoding_name: str = "cl100k_base") -> None:
         self.encoding_name = encoding_name
@@ -51,12 +99,10 @@ class TiktokenTokenCounter:
             import tiktoken  # type: ignore[import-not-found]
 
             self._encoding = tiktoken.get_encoding(encoding_name)
-        except Exception:
-            self._encoding = None
+        except Exception as exc:
+            raise RuntimeError(f"Failed to load tiktoken encoding '{encoding_name}'") from exc
 
     def count(self, text: str) -> int:
-        if self._encoding is None:
-            return len(text.split())
         return len(self._encoding.encode(text))
 
 
@@ -65,7 +111,8 @@ class HuggingFaceTokenizerCounter:
 
     The tokenizer may be a HuggingFace ``PreTrainedTokenizerBase`` or any object
     with a compatible ``__call__(text, add_special_tokens=False)`` interface.
-    If the tokenizer is unavailable or raises, counting falls back to whitespace.
+    The compiler-level fallback policy controls whether whitespace counting is
+    used when no tokenizer is available or a tokenizer call fails.
     """
 
     def __init__(
@@ -87,16 +134,16 @@ class HuggingFaceTokenizerCounter:
             self._tokenizer = cast(
                 TokenizerCallable, AutoTokenizer.from_pretrained(model_name)
             )
-        except Exception:
-            self._tokenizer = None
+        except Exception as exc:
+            raise RuntimeError(f"Failed to load HuggingFace tokenizer '{model_name}'") from exc
 
     def count(self, text: str) -> int:
         if self._tokenizer is None:
-            return len(text.split())
+            raise RuntimeError("HuggingFaceTokenizerCounter requires a valid tokenizer")
         try:
             return len(self._tokenizer(text, add_special_tokens=False)["input_ids"])
-        except Exception:
-            return len(text.split())
+        except Exception as exc:
+            raise RuntimeError("Tokenizer failed to encode text") from exc
 
 
 class TrustedRole(Enum):
@@ -212,6 +259,7 @@ class CompilerConfig:
 
     include_candidate_previews: bool = False
     max_tool_results: int = 5
+    token_fallback_policy: TokenFallbackPolicy = TokenFallbackPolicy.WHITESPACE
     max_candidate_previews: int = 3
 
 
@@ -359,7 +407,14 @@ def compile_context(
     model_type: str = "gpt4",
 ) -> ContextPacket:
     """Compile a harness snapshot into a deterministic ContextPacket."""
-    counter = token_counter or WhitespaceTokenCounter()
+    if token_counter is None:
+        counter: TokenCounter = WhitespaceTokenCounter()
+    else:
+        counter = _token_counter_with_policy(
+            token_counter,
+            fallback_policy=config.token_fallback_policy,
+            fallback=WhitespaceTokenCounter(),
+        )
 
     # Stage 1-4: select segments using the default selector.
     selector = DefaultContextSelector()
