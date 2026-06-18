@@ -34,7 +34,7 @@ from rfsn_agent.types import (
     VerificationStatus,
 )
 
-_CURRENT_STORE_SCHEMA_VERSION = 3
+_CURRENT_STORE_SCHEMA_VERSION = 4
 
 
 class StoreError(RuntimeError):
@@ -172,7 +172,11 @@ class SQLiteEventStore:
             if row is None:
                 raise StoreError(f"Trajectory not found: {trajectory_id}")
             checkpoint_sql = """
-                SELECT snapshot_json FROM harness_snapshots
+                SELECT
+                    snapshot_id, trajectory_id, epoch_id, snapshot_json, sequence,
+                    state_hash, last_event_hash, last_signature, event_count,
+                    checkpoint_hash
+                FROM harness_snapshots
                 WHERE trajectory_id = ? ORDER BY sequence DESC LIMIT 1
             """
             row = cur.execute(checkpoint_sql, (trajectory_id,)).fetchone()
@@ -180,7 +184,8 @@ class SQLiteEventStore:
                 raise StoreError(
                     f"No snapshot checkpoint found for trajectory: {trajectory_id}"
                 )
-            snapshot = HarnessSnapshot.from_dict(json.loads(row["snapshot_json"]))
+            self._validate_checkpoint_row(cur, trajectory_id, row)
+            snapshot = _snapshot_from_checkpoint_row(row)
 
             event_sql = """
                 SELECT
@@ -203,6 +208,15 @@ class SQLiteEventStore:
         snapshot = cast(
             HarnessSnapshot, self._execute_in_thread_safe_connection(_load)
         )
+        cache_key = (trajectory_id, None)
+        cached = self._snapshot_cache.get(cache_key)
+        if cached is not None:
+            if (
+                cached.sequence == snapshot.sequence
+                and cached.last_event_hash == snapshot.last_event_hash
+                and cached.last_signature == snapshot.last_signature
+            ):
+                return cached
         self._snapshot_cache[cache_key] = snapshot
         return snapshot
 
@@ -245,6 +259,11 @@ class SQLiteEventStore:
                     "SELECT version FROM schema_version ORDER BY version DESC LIMIT 1"
                 ).fetchone()
                 current_version = row["version"] if row else 0
+                if current_version > _CURRENT_STORE_SCHEMA_VERSION:
+                    raise SchemaMigrationError(
+                        f"Unsupported store schema version: {current_version} "
+                        f"(current {_CURRENT_STORE_SCHEMA_VERSION})"
+                    )
                 for version in range(current_version + 1, _CURRENT_STORE_SCHEMA_VERSION + 1):
                     _apply_migration(conn, version, self.signing_key)
                 conn.execute("COMMIT")
@@ -283,7 +302,8 @@ class SQLiteEventStore:
                 """,
                 (trajectory_id, snapshot.created_at.isoformat(), epoch_id),
             )
-            _insert_snapshot(cur, snapshot, event_count=0)
+            snapshot_id = f"genesis-{trajectory_id}"
+            _insert_snapshot(cur, snapshot, event_count=0, snapshot_id=snapshot_id)
             cur.execute("COMMIT")
         except sqlite3.IntegrityError as exc:
             cur.execute("ROLLBACK")
@@ -326,6 +346,36 @@ class SQLiteEventStore:
         cur.execute("BEGIN IMMEDIATE")
         try:
             head = self._load_trajectory_head(cur, trajectory_id)
+            request_hashes = [compute_request_hash(proposed) for proposed in proposed_events]
+            existing_entries = [
+                self._load_idempotency_entry(cur, trajectory_id, proposed.idempotency_key)
+                for proposed in proposed_events
+            ]
+            if any(existing is not None for existing in existing_entries):
+                receipts: list[CommitReceipt] = []
+                for proposed, request_hash, existing in zip(
+                    proposed_events, request_hashes, existing_entries
+                ):
+                    assert existing is not None
+                    if existing.request_hash != request_hash:
+                        raise IdempotencyConflictError(
+                            f"Idempotency key {proposed.idempotency_key!r} already used "
+                            "by a different request"
+                        )
+                    receipts.append(existing.receipt)
+                if len(receipts) != len(proposed_events):
+                    raise IdempotencyConflictError(
+                        "Batch contains a mix of new and already-committed idempotency keys"
+                    )
+                return CommitResult(
+                    trajectory_id=trajectory_id,
+                    first_sequence=head.sequence,
+                    last_sequence=head.sequence,
+                    head_hash=head.last_event_hash,
+                    committed_events=(),
+                    receipts=tuple(receipts),
+                )
+
             if head.sequence != expected_sequence:
                 raise StaleContextError(
                     f"Trajectory head changed: expected sequence {expected_sequence}, "
@@ -338,13 +388,12 @@ class SQLiteEventStore:
                 )
 
             committed: list[HarnessEvent] = []
-            receipts: list[CommitReceipt] = []
+            receipts = []
             next_sequence = head.sequence + 1
             previous_hash = head.last_event_hash
             previous_signature = head.last_signature
 
-            for proposed in proposed_events:
-                request_hash = compute_request_hash(proposed)
+            for proposed, request_hash in zip(proposed_events, request_hashes):
                 existing = self._load_idempotency_entry(
                     cur, trajectory_id, proposed.idempotency_key
                 )
@@ -408,7 +457,12 @@ class SQLiteEventStore:
 
             if head.sequence > 0 and head.sequence % 50 == 0:
                 event_count = self.get_event_count(trajectory_id)
-                _insert_snapshot(cur, head, event_count)
+                _insert_snapshot(
+                    cur,
+                    head,
+                    event_count,
+                    snapshot_id=f"checkpoint-{trajectory_id}-{head.sequence}",
+                )
 
             cur.execute("COMMIT")
             self._invalidate_snapshot_cache(trajectory_id)
@@ -428,6 +482,82 @@ class SQLiteEventStore:
             receipts=tuple(receipts),
         )
 
+    def _load_trajectory_head_projection(
+        self, cur: sqlite3.Cursor, trajectory_id: str
+    ) -> tuple[int, ContentHash | None, ContentHash | None]:
+        row = cur.execute(
+            "SELECT 1 FROM trajectories WHERE trajectory_id = ?",
+            (trajectory_id,),
+        ).fetchone()
+        if row is None:
+            raise StoreError(f"Trajectory not found: {trajectory_id}")
+
+        head = cur.execute(
+            """
+            SELECT sequence, event_hash, signature
+            FROM harness_events
+            WHERE trajectory_id = ?
+            ORDER BY sequence DESC
+            LIMIT 1
+            """,
+            (trajectory_id,),
+        ).fetchone()
+        if head is None:
+            return 0, None, None
+        return (
+            int(head["sequence"]),
+            ContentHash(head["event_hash"]),
+            ContentHash(head["signature"]) if head["signature"] else None,
+        )
+
+    def _validate_checkpoint_row(
+        self, cur: sqlite3.Cursor, trajectory_id: str, row: sqlite3.Row
+    ) -> None:
+        sequence = int(row["sequence"])
+        event_count = int(row["event_count"])
+        expected_count = cur.execute(
+            """
+            SELECT COUNT(*) AS cnt FROM harness_events
+            WHERE trajectory_id = ? AND sequence <= ?
+            """,
+            (trajectory_id, sequence),
+        ).fetchone()["cnt"]
+        if expected_count != sequence or event_count != sequence:
+            raise StoreError(
+                f"checkpoint sequence {sequence} is not backed by event history"
+            )
+
+        expected_hash = _checkpoint_hash_from_row(row)
+        if row["checkpoint_hash"] != expected_hash:
+            raise StoreError("Checkpoint hash does not match authenticated event history")
+
+        snapshot = _snapshot_from_checkpoint_row(row)
+        if snapshot.sequence != sequence or snapshot.state_hash != row["state_hash"]:
+            raise StoreError("Checkpoint snapshot metadata does not match stored state")
+        if snapshot.last_event_hash != row["last_event_hash"]:
+            raise StoreError("Checkpoint last_event_hash does not match stored state")
+        if snapshot.last_signature != row["last_signature"]:
+            raise StoreError("Checkpoint last_signature does not match stored state")
+
+        if sequence == 0:
+            if snapshot.last_event_hash is not None:
+                raise StoreError("Genesis checkpoint must not reference an event hash")
+            return
+
+        event_row = cur.execute(
+            """
+            SELECT event_hash, signature FROM harness_events
+            WHERE trajectory_id = ? AND sequence = ?
+            """,
+            (trajectory_id, sequence),
+        ).fetchone()
+        if event_row is None:
+            raise StoreError(f"Checkpoint sequence {sequence} has no matching event")
+        if event_row["event_hash"] != snapshot.last_event_hash:
+            raise StoreError("Checkpoint event hash does not match event history")
+        if event_row["signature"] != snapshot.last_signature:
+            raise StoreError("Checkpoint signature does not match event history")
+
     def _load_trajectory_head(
         self, cur: sqlite3.Cursor, trajectory_id: str
     ) -> HarnessSnapshot:
@@ -445,13 +575,18 @@ class SQLiteEventStore:
             raise StoreError(f"Trajectory not found: {trajectory_id}")
 
         checkpoint_sql = """
-            SELECT snapshot_json FROM harness_snapshots
+            SELECT
+                snapshot_id, trajectory_id, epoch_id, snapshot_json, sequence,
+                state_hash, last_event_hash, last_signature, event_count,
+                checkpoint_hash
+            FROM harness_snapshots
             WHERE trajectory_id = ? ORDER BY sequence DESC LIMIT 1
         """
         row = cur.execute(checkpoint_sql, (trajectory_id,)).fetchone()
         if row is None:
             raise StoreError(f"No snapshot checkpoint found for trajectory: {trajectory_id}")
-        snapshot = HarnessSnapshot.from_dict(json.loads(row["snapshot_json"]))
+        self._validate_checkpoint_row(cur, trajectory_id, row)
+        snapshot = _snapshot_from_checkpoint_row(row)
 
         event_sql = """
             SELECT
@@ -582,7 +717,11 @@ class SQLiteEventStore:
             raise StoreError(f"Trajectory not found: {trajectory_id}")
 
         checkpoint_sql = """
-            SELECT snapshot_json FROM harness_snapshots
+            SELECT
+                snapshot_id, trajectory_id, epoch_id, snapshot_json, sequence,
+                state_hash, last_event_hash, last_signature, event_count,
+                checkpoint_hash
+            FROM harness_snapshots
             WHERE trajectory_id = ?
         """
         params: list[Any] = [trajectory_id]
@@ -593,7 +732,8 @@ class SQLiteEventStore:
         row = cur.execute(checkpoint_sql, params).fetchone()
         if row is None:
             raise StoreError(f"No snapshot checkpoint found for trajectory: {trajectory_id}")
-        snapshot = HarnessSnapshot.from_dict(json.loads(row["snapshot_json"]))
+        self._validate_checkpoint_row(cur, trajectory_id, row)
+        snapshot = _snapshot_from_checkpoint_row(row)
         events = self.get_events(trajectory_id, after_sequence=snapshot.sequence)
         for event in events:
             if up_to_sequence is not None and event.sequence > up_to_sequence:
@@ -606,23 +746,51 @@ class SQLiteEventStore:
         cache_key = (trajectory_id, None)
         cached = self._snapshot_cache.get(cache_key)
         if cached is not None:
-            return cached
+            cur = self._cursor()
+            head_sequence, head_last_hash, head_last_signature = (
+                self._load_trajectory_head_projection(cur, trajectory_id)
+            )
+            if (
+                cached.sequence == head_sequence
+                and cached.last_event_hash == head_last_hash
+                and cached.last_signature == head_last_signature
+            ):
+                return cached
+            self._invalidate_snapshot_cache(trajectory_id)
+
         snapshot = self.replay(trajectory_id)
         self._snapshot_cache[cache_key] = snapshot
         return snapshot
 
     def save_snapshot(self, snapshot: HarnessSnapshot, event_count: int) -> None:
-        """Persist a snapshot checkpoint for fast recovery."""
+        """Persist a snapshot checkpoint checkpointed from the validated event head."""
         cur = self._cursor()
         cur.execute("BEGIN IMMEDIATE")
         try:
-            _insert_snapshot(cur, snapshot, event_count)
+            head_sequence, head_last_hash, head_last_signature = (
+                self._load_trajectory_head_projection(cur, snapshot.trajectory_id)
+            )
+            if (
+                snapshot.sequence != head_sequence
+                or snapshot.last_event_hash != head_last_hash
+                or snapshot.last_signature != head_last_signature
+            ):
+                raise StoreError("Snapshot checkpoint does not match authenticated event history")
+            _insert_snapshot(
+                cur,
+                snapshot,
+                event_count,
+                snapshot_id=f"checkpoint-{snapshot.trajectory_id}-{snapshot.sequence}",
+            )
             cur.execute("COMMIT")
         except sqlite3.IntegrityError as exc:
             cur.execute("ROLLBACK")
             raise StoreError(
                 f"Snapshot checkpoint conflict for {snapshot.trajectory_id}"
             ) from exc
+        except StoreError:
+            cur.execute("ROLLBACK")
+            raise
 
     def get_latest_checkpoint_sequence(self, trajectory_id: str) -> int | None:
         """Return the sequence of the most recent saved snapshot checkpoint."""
@@ -673,12 +841,78 @@ def _apply_migration(
         _apply_v2_migration(conn)
     elif version == 3:
         _apply_v3_migration(conn, signing_key)
+    elif version == 4:
+        _apply_v4_migration(conn)
     else:
         raise SchemaMigrationError(f"Unknown migration version: {version}")
 
     conn.execute(
         "INSERT OR REPLACE INTO schema_version (version) VALUES (?)",
         (version,),
+    )
+
+
+def _apply_v4_migration(conn: sqlite3.Connection) -> None:
+    """Add authenticated checkpoint columns and backfill existing checkpoints."""
+    conn.execute("ALTER TABLE harness_snapshots ADD COLUMN checkpoint_hash TEXT")
+
+    rows = conn.execute(
+        """
+        SELECT snapshot_id, trajectory_id, epoch_id, sequence, state_hash,
+               last_event_hash, created_at, event_count, snapshot_json
+        FROM harness_snapshots
+        """
+    ).fetchall()
+
+    for row in rows:
+        snapshot = HarnessSnapshot.from_dict(json.loads(row["snapshot_json"]))
+        checkpoint_hash = _checkpoint_hash(
+            snapshot, int(row["event_count"]), snapshot_id=row["snapshot_id"]
+        )
+        conn.execute(
+            """
+            UPDATE harness_snapshots
+            SET checkpoint_hash = ?
+            WHERE snapshot_id = ?
+            """,
+            (checkpoint_hash, row["snapshot_id"]),
+        )
+
+    conn.execute(
+        """
+        CREATE TABLE harness_snapshots_new (
+            snapshot_id TEXT PRIMARY KEY,
+            trajectory_id TEXT NOT NULL,
+            epoch_id TEXT NOT NULL,
+            sequence INTEGER NOT NULL,
+            state_hash TEXT NOT NULL,
+            last_event_hash TEXT,
+            last_signature TEXT,
+            created_at TEXT NOT NULL,
+            event_count INTEGER NOT NULL,
+            snapshot_json TEXT NOT NULL,
+            checkpoint_hash TEXT NOT NULL,
+            FOREIGN KEY (trajectory_id) REFERENCES trajectories(trajectory_id),
+            UNIQUE(trajectory_id, sequence)
+        )
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO harness_snapshots_new
+        SELECT snapshot_id, trajectory_id, epoch_id, sequence, state_hash,
+               last_event_hash, last_signature, created_at, event_count,
+               snapshot_json, checkpoint_hash
+        FROM harness_snapshots
+        """
+    )
+    conn.execute("DROP TABLE harness_snapshots")
+    conn.execute("ALTER TABLE harness_snapshots_new RENAME TO harness_snapshots")
+    conn.execute(
+        """
+        CREATE INDEX idx_harness_snapshots_trajectory_sequence
+        ON harness_snapshots(trajectory_id, sequence)
+        """
     )
 
 
@@ -1239,17 +1473,22 @@ def _insert_event(
 
 
 def _insert_snapshot(
-    cur: sqlite3.Cursor, snapshot: HarnessSnapshot, event_count: int
+    cur: sqlite3.Cursor,
+    snapshot: HarnessSnapshot,
+    event_count: int,
+    *,
+    snapshot_id: str,
 ) -> None:
+    checkpoint_hash = _checkpoint_hash(snapshot, event_count, snapshot_id=snapshot_id)
     cur.execute(
         """
-        INSERT OR REPLACE INTO harness_snapshots (
+        INSERT INTO harness_snapshots (
             snapshot_id, trajectory_id, epoch_id, sequence, state_hash,
-            last_event_hash, created_at, event_count, snapshot_json
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            last_event_hash, created_at, event_count, snapshot_json, checkpoint_hash
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
-            str(uuid.uuid4()),
+            snapshot_id,
             snapshot.trajectory_id,
             snapshot.epoch_id,
             snapshot.sequence,
@@ -1258,8 +1497,54 @@ def _insert_snapshot(
             snapshot.created_at.isoformat(),
             event_count,
             json.dumps(snapshot.to_dict(), sort_keys=True),
+            checkpoint_hash,
         ),
     )
+
+
+def _checkpoint_hash(
+    snapshot: HarnessSnapshot, event_count: int, *, snapshot_id: str
+) -> ContentHash:
+    material = {
+        "snapshot_id": snapshot_id,
+        "trajectory_id": snapshot.trajectory_id,
+        "epoch_id": snapshot.epoch_id,
+        "sequence": snapshot.sequence,
+        "state_hash": snapshot.state_hash,
+        "last_event_hash": snapshot.last_event_hash,
+        "last_signature": snapshot.last_signature,
+        "event_count": event_count,
+        "snapshot_hash": snapshot.state_hash,
+    }
+    return hash_content(canonical_json(material))
+
+
+def _checkpoint_hash_from_row(row: sqlite3.Row) -> ContentHash:
+    material = {
+        "snapshot_id": row["snapshot_id"],
+        "trajectory_id": row["trajectory_id"],
+        "epoch_id": row["epoch_id"],
+        "sequence": int(row["sequence"]),
+        "state_hash": row["state_hash"],
+        "last_event_hash": row["last_event_hash"],
+        "last_signature": row["last_signature"],
+        "event_count": int(row["event_count"]),
+        "snapshot_hash": row["state_hash"],
+    }
+    return hash_content(canonical_json(material))
+
+
+def _snapshot_from_checkpoint_row(row: sqlite3.Row) -> HarnessSnapshot:
+    snapshot = HarnessSnapshot.from_dict(json.loads(row["snapshot_json"]))
+    if snapshot.sequence != int(row["sequence"]):
+        raise StoreError("Checkpoint sequence metadata does not match snapshot")
+    if snapshot.state_hash != row["state_hash"]:
+        raise StoreError("Checkpoint state hash does not match snapshot")
+    if snapshot.last_event_hash != row["last_event_hash"]:
+        raise StoreError("Checkpoint last_event_hash does not match snapshot")
+    if snapshot.last_signature != row["last_signature"]:
+        raise StoreError("Checkpoint last_signature does not match snapshot")
+    return snapshot
 
 
 def _event_from_row(

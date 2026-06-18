@@ -204,6 +204,19 @@ def _handle_tool_invoked(snapshot: HarnessSnapshot, event: HarnessEvent) -> Harn
         deadline=payload.deadline,
         provenance=_with_event_provenance(event),
     )
+    invocation = ToolInvocation(
+        invocation_id=invocation.invocation_id,
+        trajectory_id=invocation.trajectory_id,
+        action_id=invocation.action_id,
+        parent_task_id=invocation.parent_task_id,
+        tool_name=invocation.tool_name,
+        arguments=invocation.arguments,
+        arguments_hash=invocation.arguments_hash,
+        dependency_ids=invocation.dependency_ids,
+        deadline=invocation.deadline,
+        created_at=event.header.created_at,
+        provenance=invocation.provenance,
+    )
     budget = snapshot.budget.spend(tokens=0, tool_calls=1) if snapshot.budget is not None else None
     return _next_snapshot(
         snapshot,
@@ -236,6 +249,17 @@ def _handle_tool_result_received(
         content=payload.content,
         provenance=_with_event_provenance(event),
     )
+    result = ToolResult(
+        result_id=result.result_id,
+        invocation_id=result.invocation_id,
+        trajectory_id=result.trajectory_id,
+        status=result.status,
+        content=result.content,
+        content_hash=result.content_hash,
+        received_at=event.header.created_at,
+        provenance=result.provenance,
+        content_ref=result.content_ref,
+    )
     return _next_snapshot(
         snapshot,
         event,
@@ -265,6 +289,17 @@ def _handle_evidence_curated(
         source_ids=payload.source_ids,
         provenance=_with_event_provenance(event),
     )
+    curated = CuratedItem(
+        item_id=curated.item_id,
+        trajectory_id=curated.trajectory_id,
+        candidate_ids=curated.candidate_ids,
+        content=curated.content,
+        content_hash=curated.content_hash,
+        priority=curated.priority,
+        source_ids=curated.source_ids,
+        created_at=event.header.created_at,
+        provenance=curated.provenance,
+    )
     return _next_snapshot(
         snapshot,
         event,
@@ -287,6 +322,16 @@ def _handle_claim_revised(
         status=new_status,
         evidence_link_ids=old_claim.evidence_link_ids,
         provenance=_with_event_provenance(event),
+    )
+    revised = Claim(
+        claim_id=revised.claim_id,
+        trajectory_id=revised.trajectory_id,
+        content=revised.content,
+        content_hash=revised.content_hash,
+        status=revised.status,
+        evidence_link_ids=revised.evidence_link_ids,
+        created_at=revised.created_at,
+        provenance=revised.provenance,
     )
     claims = _replace_at(snapshot.claims, claim_index, revised)
     return _next_snapshot(snapshot, event, claims=claims)
@@ -318,6 +363,18 @@ def _handle_evidence_verified(
         result=payload.result,
         details=payload.details,
         provenance=_with_event_provenance(event),
+    )
+    record = VerificationRecord(
+        record_id=record.record_id,
+        trajectory_id=record.trajectory_id,
+        link_id=record.link_id,
+        claim_id=record.claim_id,
+        method=record.method,
+        result=record.result,
+        details=record.details,
+        details_hash=record.details_hash,
+        created_at=event.header.created_at,
+        provenance=record.provenance,
     )
 
     current_status = _verification_status_from_result(payload.result)
@@ -432,6 +489,16 @@ def _handle_submission_recorded(
         source_ids=payload.source_ids,
         provenance=_with_event_provenance(event),
     )
+    submission = SubmissionRecord(
+        submission_id=submission.submission_id,
+        trajectory_id=submission.trajectory_id,
+        content=submission.content,
+        content_hash=submission.content_hash,
+        source_ids=submission.source_ids,
+        submitted_at=event.header.created_at,
+        provenance=submission.provenance,
+        content_ref=submission.content_ref,
+    )
     return _next_snapshot(
         snapshot,
         event,
@@ -470,6 +537,18 @@ def _handle_candidate_added(
         content=payload.content,
         provenance=_with_event_provenance(event),
     )
+    candidate = CandidateItem(
+        item_id=candidate.item_id,
+        trajectory_id=candidate.trajectory_id,
+        source_id=candidate.source_id,
+        retrieval_query=candidate.retrieval_query,
+        content=candidate.content,
+        content_hash=candidate.content_hash,
+        metadata=candidate.metadata,
+        created_at=event.header.created_at,
+        provenance=candidate.provenance,
+        content_ref=candidate.content_ref,
+    )
     return _next_snapshot(
         snapshot,
         event,
@@ -488,6 +567,16 @@ def _handle_claim_created(
         content=payload.content,
         status=ClaimStatus.STATED,
         provenance=_with_event_provenance(event),
+    )
+    claim = Claim(
+        claim_id=claim.claim_id,
+        trajectory_id=claim.trajectory_id,
+        content=claim.content,
+        content_hash=claim.content_hash,
+        status=claim.status,
+        evidence_link_ids=claim.evidence_link_ids,
+        created_at=event.header.created_at,
+        provenance=claim.provenance,
     )
     return _next_snapshot(
         snapshot,

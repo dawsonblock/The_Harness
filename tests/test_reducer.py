@@ -73,6 +73,37 @@ def _event(
     )
 
 
+def test_reducer_uses_event_timestamps_for_created_domain_objects() -> None:
+    snap = HarnessSnapshot.create(
+        trajectory_id="traj-1",
+        epoch_id="epoch-0",
+        sequence=0,
+        budget=BudgetLedger(trajectory_id="traj-1", max_tokens=1000),
+    )
+    fixed_time = datetime(2030, 1, 1, tzinfo=UTC)
+    event = HarnessEvent.create(
+        event_id="evt-fixed",
+        trajectory_id="traj-1",
+        sequence=1,
+        event_type="task_decomposed",
+        payload=TaskDecomposedPayload(
+            parent_task_id=None,
+            task_id="task-1",
+            description="task",
+            dependency_ids=(),
+        ),
+        idempotency_key="idem-1",
+        previous_event_hash=None,
+        created_at=fixed_time,
+        actor="policy",
+        action_id="act-1",
+    )
+
+    next_snap = reduce_event(snap, event)
+
+    assert next_snap.tasks[0].created_at == fixed_time
+
+
 def test_action_committed_advances_sequence_only() -> None:
     snap = _empty_snapshot()
     event = _event(

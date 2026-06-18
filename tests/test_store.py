@@ -77,6 +77,159 @@ def test_commit_and_replay_single_event() -> None:
         assert snap1.last_event_hash is not None
 
 
+def test_replay_is_deterministic_after_reopen() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        db_path = Path(tmp) / "events.db"
+        store = SQLiteEventStore(db_path)
+        store.init_trajectory("traj-1")
+        snap0 = store.get_latest_snapshot("traj-1")
+        store.commit_events(
+            trajectory_id="traj-1",
+            expected_sequence=snap0.sequence,
+            expected_head_hash=snap0.last_event_hash,
+            proposed_events=(
+                ProposedEvent(
+                    event_type="task_decomposed",
+                    payload=TaskDecomposedPayload(
+                        parent_task_id=None,
+                        task_id="task-1",
+                        description="task",
+                        dependency_ids=(),
+                    ),
+                    idempotency_key="idem-1",
+                    actor="policy",
+                    action_id="act-1",
+                ),
+            ),
+        )
+        before = store.get_latest_snapshot("traj-1").state_hash
+        store.close()
+
+        reopened = SQLiteEventStore(db_path)
+        try:
+            after = reopened.get_latest_snapshot("traj-1").state_hash
+        finally:
+            reopened.close()
+
+        assert after == before
+
+
+def test_forged_checkpoint_is_rejected_on_replay() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        store = SQLiteEventStore(Path(tmp) / "events.db")
+        store.init_trajectory("traj-1")
+        snap0 = store.get_latest_snapshot("traj-1")
+        store.commit_events(
+            trajectory_id="traj-1",
+            expected_sequence=snap0.sequence,
+            expected_head_hash=snap0.last_event_hash,
+            proposed_events=(
+                ProposedEvent(
+                    event_type="action_committed",
+                    payload=_committed_payload(),
+                    idempotency_key="idem-1",
+                    actor="policy",
+                    action_id="act-1",
+                ),
+            ),
+        )
+        forged = store.get_latest_snapshot("traj-1")
+
+        conn = sqlite3.connect(str(store.db_path))
+        try:
+            conn.execute(
+                "DELETE FROM harness_snapshots WHERE trajectory_id = ?",
+                ("traj-1",),
+            )
+            conn.execute(
+                """
+                INSERT INTO harness_snapshots
+                (snapshot_id, trajectory_id, epoch_id, sequence, state_hash,
+                 created_at, event_count, snapshot_json, last_event_hash,
+                 last_signature, checkpoint_hash)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "evil",
+                    "traj-1",
+                    "evil",
+                    999,
+                    forged.state_hash,
+                    forged.created_at.isoformat(),
+                    0,
+                    json.dumps(forged.to_dict()),
+                    "f" * 64,
+                    None,
+                    "c" * 64,
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        with pytest.raises(StoreError, match="checkpoint.*event history"):
+            store.replay("traj-1")
+
+
+def test_snapshot_cache_checks_authoritative_head_across_instances() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        db_path = Path(tmp) / "events.db"
+        store1 = SQLiteEventStore(db_path)
+        store2 = SQLiteEventStore(db_path)
+        store1.init_trajectory("traj-1")
+        cached = store1.get_latest_snapshot("traj-1")
+        snap0 = store2.get_latest_snapshot("traj-1")
+        store2.commit_events(
+            trajectory_id="traj-1",
+            expected_sequence=snap0.sequence,
+            expected_head_hash=snap0.last_event_hash,
+            proposed_events=(
+                ProposedEvent(
+                    event_type="action_committed",
+                    payload=_committed_payload(),
+                    idempotency_key="idem-1",
+                    actor="policy",
+                    action_id="act-1",
+                ),
+            ),
+        )
+
+        latest = store1.get_latest_snapshot("traj-1")
+
+        assert latest.sequence == 1
+        assert latest.sequence != cached.sequence
+
+
+def test_lost_response_retry_returns_original_receipt_before_head_check() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        store = SQLiteEventStore(Path(tmp) / "events.db")
+        store.init_trajectory("traj-1")
+        snap0 = store.get_latest_snapshot("traj-1")
+        prop = ProposedEvent(
+            event_type="action_committed",
+            payload=_committed_payload(),
+            idempotency_key="idem-1",
+            actor="policy",
+            action_id="act-1",
+        )
+        result1 = store.commit_events(
+            trajectory_id="traj-1",
+            expected_sequence=snap0.sequence,
+            expected_head_hash=snap0.last_event_hash,
+            proposed_events=(prop,),
+        )
+
+        result2 = store.commit_events(
+            trajectory_id="traj-1",
+            expected_sequence=snap0.sequence,
+            expected_head_hash=snap0.last_event_hash,
+            proposed_events=(prop,),
+        )
+
+        assert result2.receipts[0].event_id == result1.receipts[0].event_id
+        assert store.get_event_count("traj-1") == 1
+
+
 def test_replay_produces_same_snapshot_as_in_memory_reduction() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         store = SQLiteEventStore(Path(tmp) / "events.db")
