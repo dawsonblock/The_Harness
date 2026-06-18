@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import importlib.util
+
 import pytest
 
 from rfsn_kv.codecs import CODEC_REGISTRY, get_codec
@@ -178,3 +180,11 @@ class TestCodecRegistry:
     def test_registry_has_expected_keys(self) -> None:
         assert "identity" in CODEC_REGISTRY
         assert "quantize" in CODEC_REGISTRY
+
+    def test_mlx_tensor_codec_is_optional(self) -> None:
+        has_mlx = importlib.util.find_spec("mlx.core") is not None
+        if has_mlx:
+            assert "mlx_tensor" in CODEC_REGISTRY
+        else:
+            assert "mlx_tensor" not in CODEC_REGISTRY
+

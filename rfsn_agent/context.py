@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum, auto
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 
 from rfsn_agent.common import canonical_json, hash_content
 from rfsn_agent.domain import (
@@ -22,6 +22,13 @@ class TokenCounter(Protocol):
     """Protocol for deterministic token counting."""
 
     def count(self, text: str) -> int:
+        ...
+
+
+class TokenizerCallable(Protocol):
+    """Callable protocol for tokenizers accepting ``add_special_tokens``."""
+
+    def __call__(self, text: str, *, add_special_tokens: bool = False) -> dict[str, Any]:
         ...
 
 
@@ -67,16 +74,19 @@ class HuggingFaceTokenizerCounter:
         model_name: str | None = None,
     ) -> None:
         self.model_name = model_name
+        self._tokenizer: TokenizerCallable | None
         if tokenizer is not None:
-            self._tokenizer = tokenizer
+            self._tokenizer = cast(TokenizerCallable, tokenizer)
             return
         if model_name is None:
             self._tokenizer = None
             return
         try:
-            from transformers import AutoTokenizer  # type: ignore[import-not-found]
+            from transformers import AutoTokenizer
 
-            self._tokenizer = AutoTokenizer.from_pretrained(model_name)
+            self._tokenizer = cast(
+                TokenizerCallable, AutoTokenizer.from_pretrained(model_name)
+            )
         except Exception:
             self._tokenizer = None
 

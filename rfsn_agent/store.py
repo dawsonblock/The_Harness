@@ -6,10 +6,11 @@ import json
 import sqlite3
 import threading
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, cast
 
 from rfsn_agent.cas import ContentAddressedStore
 from rfsn_agent.common import canonical_json, hash_content, utc_now
@@ -199,7 +200,9 @@ class SQLiteEventStore:
                 snapshot = reduce_event(snapshot, event)
             return snapshot
 
-        snapshot = self._execute_in_thread_safe_connection(_load)
+        snapshot = cast(
+            HarnessSnapshot, self._execute_in_thread_safe_connection(_load)
+        )
         self._snapshot_cache[cache_key] = snapshot
         return snapshot
 
@@ -1336,17 +1339,17 @@ def _maybe_offload_to_cas(obj: Any, cas: ContentAddressedStore | None) -> Any:
         return obj
 
     root: Any = obj
-    stack: list[tuple[Any, tuple[Any, ...] | None, str | None]] = [(obj, None, None)]
+    stack: list[tuple[Any, tuple[Any, Any] | None]] = [(obj, None)]
 
     while stack:
-        current, parent_items, key_in_parent = stack.pop()
+        current, parent = stack.pop()
 
         if isinstance(current, str):
             replacement: Any = (
                 {"__cas_ref__": cas.put(current)} if len(current) > 4096 else current
             )
-            if parent_items is not None and key_in_parent is not None:
-                container, parent_key = parent_items, key_in_parent
+            if parent is not None:
+                container, parent_key = parent
                 if isinstance(container, list):
                     container[int(parent_key)] = replacement
                 elif isinstance(container, dict):
@@ -1356,15 +1359,13 @@ def _maybe_offload_to_cas(obj: Any, cas: ContentAddressedStore | None) -> Any:
             continue
 
         if isinstance(current, list):
-            stack.append((current, None, None))
-            for idx in range(len(current) - 1, -1, -1):
-                stack.append((current[idx], (current, None), str(idx)))
+            for idx, value in enumerate(current):
+                stack.append((value, (current, idx)))
             continue
 
         if isinstance(current, dict):
-            stack.append((current, None, None))
-            for dict_key, value in reversed(list(current.items())):
-                stack.append((value, (current, dict_key), None))
+            for dict_key, value in list(current.items()):
+                stack.append((value, (current, dict_key)))
             continue
 
     return root
@@ -1376,15 +1377,14 @@ def _maybe_resolve_from_cas(obj: Any, cas: ContentAddressedStore | None) -> Any:
         return obj
 
     root: Any = obj
-    stack: list[tuple[Any, tuple[Any, ...] | None, str | None]] = [(obj, None, None)]
+    stack: list[tuple[Any, tuple[Any, Any] | None]] = [(obj, None)]
 
     while stack:
-        current, parent_items, key_in_parent = stack.pop()
+        current, parent = stack.pop()
 
         if isinstance(current, list):
-            stack.append((current, None, None))
-            for idx in range(len(current) - 1, -1, -1):
-                stack.append((current[idx], (current, None), str(idx)))
+            for idx, value in enumerate(current):
+                stack.append((value, (current, idx)))
             continue
 
         if isinstance(current, dict):
@@ -1392,8 +1392,8 @@ def _maybe_resolve_from_cas(obj: Any, cas: ContentAddressedStore | None) -> Any:
                 current["__cas_ref__"], str
             ):
                 replacement = cas.get_text(current["__cas_ref__"])
-                if parent_items is not None and key_in_parent is not None:
-                    container, parent_key = parent_items, key_in_parent
+                if parent is not None:
+                    container, parent_key = parent
                     if isinstance(container, list):
                         container[int(parent_key)] = replacement
                     elif isinstance(container, dict):
@@ -1402,9 +1402,8 @@ def _maybe_resolve_from_cas(obj: Any, cas: ContentAddressedStore | None) -> Any:
                     root = replacement
                 continue
 
-            stack.append((current, None, None))
-            for dict_key, value in reversed(list(current.items())):
-                stack.append((value, (current, dict_key), None))
+            for dict_key, value in list(current.items()):
+                stack.append((value, (current, dict_key)))
             continue
 
     return root

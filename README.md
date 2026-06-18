@@ -40,12 +40,15 @@ graph TB
 | `rfsn_agent/domain.py` | Immutable domain schemas | 682 |
 | `rfsn_agent/events.py` | Append-only event schemas | 606 |
 | `rfsn_agent/reducer.py` | Pure event reducer with invariant checks | 600 |
-| `rfsn_agent/store.py` | SQLite WAL persistence | 1,387 |
-| `rfsn_agent/context.py` | Deterministic context compiler | 712 |
-| `rfsn_agent/actions.py` | Typed semantic actions | 554 |
-| `rfsn_agent/runtime.py` | Agent runtime loop | 168 |
+| `rfsn_agent/store.py` | SQLite WAL persistence | 1,524 |
+| `rfsn_agent/context.py` | Deterministic context compiler | 760 |
+| `rfsn_agent/actions.py` | Typed semantic actions | 578 |
+| `rfsn_agent/runtime.py` | Agent runtime loop | 178 |
 | `rfsn_agent/cas.py` | Content-addressed store | 141 |
-| `rfsn_agent/security.py` | Safety profiles | 41 |
+| `rfsn_agent/security.py` | Safety profiles | 57 |
+| `rfsn_agent/tool_worker.py` | Async tool execution with lease deduplication | 292 |
+| `rfsn_agent/omlx.py` | OMLX inference adapter protocols | 155 |
+| `rfsn_agent/evaluation.py` | Objective evaluator and cryptographic receipts | 178 |
 | `rfsn_kv/types.py` | KV identifiers and enumerations | 41 |
 | `rfsn_kv/common.py` | KV hashing and serialization utilities | 221 |
 | `rfsn_kv/pages.py` | Immutable KV page representation | 186 |
@@ -86,10 +89,10 @@ python -m ruff check rfsn_agent rfsn_kv tests
 | 4 | Deterministic ContextPacket compiler | ✅ Complete |
 | 5 | Typed semantic actions with validated preconditions | ✅ Complete |
 | 6 | Context epochs and prefix/suffix reuse rules | ✅ Complete |
-| 7 | OMLX inference adapter | 🔲 Not started |
+| 7 | OMLX inference adapter | ✅ Complete |
 | 8 | One multi-file coding benchmark | 🔲 Not started |
-| 9 | Objective evaluator and receipts | 🔲 Not started |
-| 10 | Compressed-page experiments | 🔲 Not started |
+| 9 | Objective evaluator and receipts | ✅ Complete |
+| 10 | Optional MLX tensor codec and compressed-page kernel protocols | ✅ Complete |
 
 ## Conventions
 

@@ -429,7 +429,7 @@ def test_default_context_selector_matches_old_collect_segments() -> None:
 
 
 def test_huggingface_tokenizer_counter_uses_injected_tokenizer() -> None:
-    def fake_tokenizer(text: str) -> dict[str, list[int]]:
+    def fake_tokenizer(text: str, **_: object) -> dict[str, list[int]]:
         return {"input_ids": list(range(len(text)))}
 
     counter = HuggingFaceTokenizerCounter(tokenizer=fake_tokenizer)
@@ -438,7 +438,7 @@ def test_huggingface_tokenizer_counter_uses_injected_tokenizer() -> None:
 
 
 def test_huggingface_tokenizer_counter_falls_back_when_tokenizer_raises() -> None:
-    def failing_tokenizer(text: str) -> dict[str, list[int]]:
+    def failing_tokenizer(text: str, **_: object) -> dict[str, list[int]]:
         raise RuntimeError("tokenizer unavailable")
 
     counter = HuggingFaceTokenizerCounter(tokenizer=failing_tokenizer)
@@ -446,7 +446,7 @@ def test_huggingface_tokenizer_counter_falls_back_when_tokenizer_raises() -> Non
 
 
 def test_compile_context_uses_injected_tokenizer() -> None:
-    def fake_tokenizer(text: str) -> dict[str, list[int]]:
+    def fake_tokenizer(text: str, **_: object) -> dict[str, list[int]]:
         # Every word maps to exactly two tokens.
         return {"input_ids": list(range(len(text.split()) * 2))}
 

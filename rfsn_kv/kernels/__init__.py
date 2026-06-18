@@ -7,7 +7,7 @@ For now, it provides protocol definitions and placeholder interfaces.
 
 from __future__ import annotations
 
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 
 @runtime_checkable
@@ -30,4 +30,42 @@ class FusedAttentionKernel(Protocol):
         ...
 
 
-__all__: list[str] = ["FusedAttentionKernel"]
+@runtime_checkable
+class MLXAttentionKernel(FusedAttentionKernel, Protocol):
+    """Protocol for an MLX fused attention kernel."""
+
+    def execute(
+        self,
+        *,
+        q: Any,
+        k: Any,
+        v: Any,
+        scale: float | None = None,
+        cache: Any | None = None,
+    ) -> Any:
+        """Run fused attention on MLX arrays."""
+        ...
+
+
+@runtime_checkable
+class CompressedPageAttentionKernel(FusedAttentionKernel, Protocol):
+    """Protocol for attention over compressed KV page payloads."""
+
+    def execute(
+        self,
+        *,
+        query: Any,
+        compressed_pages: Any,
+        page_table: Any | None = None,
+        codec_id: str | None = None,
+    ) -> Any:
+        """Run attention using compressed KV pages."""
+        ...
+
+
+__all__: list[str] = [
+    "FusedAttentionKernel",
+    "MLXAttentionKernel",
+    "CompressedPageAttentionKernel",
+]
+

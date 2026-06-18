@@ -8,6 +8,7 @@ inference adapter bridges these types with the harness via the
 
 from rfsn_kv.codecs import CODEC_REGISTRY, get_codec
 from rfsn_kv.codecs.identity import IdentityCodec
+from rfsn_kv.codecs.mlx_tensor import MLXTensorCodec, MLXUnavailableError
 from rfsn_kv.codecs.quantize import QuantizeCodec
 from rfsn_kv.common import canonical_json, hash_bytes, hash_content, sha256_hash
 from rfsn_kv.integrity import IntegrityChecker, IntegrityReport
@@ -41,6 +42,8 @@ __all__: list[str] = [
     "KVPersistence",
     "LayerIndex",
     "LRUEvictionPolicy",
+    "MLXTensorCodec",
+    "MLXUnavailableError",
     "NodeId",
     "PageId",
     "PageRange",

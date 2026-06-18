@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from rfsn_kv.codecs.base import KVCodec
 from rfsn_kv.codecs.identity import IdentityCodec
+from rfsn_kv.codecs.mlx_tensor import MLXTensorCodec, MLXUnavailableError
 from rfsn_kv.codecs.quantize import QuantizeCodec
 
 # Global codec registry — maps codec_id → codec instance.
@@ -15,6 +16,13 @@ CODEC_REGISTRY: dict[str, KVCodec] = {
     "identity": IdentityCodec(),
     "quantize": QuantizeCodec(bit_width=8, group_size=64),
 }
+
+try:
+    CODEC_REGISTRY["mlx_tensor"] = MLXTensorCodec()
+except MLXUnavailableError:
+    # MLX is optional on non-Metal hosts; callers can import MLXTensorCodec
+    # directly and handle MLXUnavailableError when they call compress/decompress.
+    pass
 
 
 def get_codec(codec_id: str) -> KVCodec:
@@ -37,4 +45,6 @@ __all__: list[str] = [
     "get_codec",
     "IdentityCodec",
     "QuantizeCodec",
+    "MLXTensorCodec",
+    "MLXUnavailableError",
 ]

@@ -43,6 +43,12 @@ from rfsn_agent.domain import (
     ToolResult,
     VerificationRecord,
 )
+from rfsn_agent.evaluation import (
+    EvaluationResult,
+    ObjectiveEvaluator,
+    ObjectiveReceipt,
+    ObjectiveSpec,
+)
 from rfsn_agent.events import (
     ActionCommittedPayload,
     ClaimRevisedPayload,
@@ -56,6 +62,13 @@ from rfsn_agent.events import (
     TaskDecomposedPayload,
     ToolInvokedPayload,
     ToolResultReceivedPayload,
+)
+from rfsn_agent.omlx import (
+    OMLXInferenceAdapter,
+    OMLXInferencePolicy,
+    OMLXInferenceRequest,
+    OMLXInferenceResponse,
+    OMLXKVCacheProvider,
 )
 from rfsn_agent.reducer import (
     InvariantError,
@@ -93,6 +106,10 @@ __all__: list[str] = [
     "reduce_event",
     "ReducerError",
     "InvariantError",
+    "ObjectiveEvaluator",
+    "ObjectiveSpec",
+    "ObjectiveReceipt",
+    "EvaluationResult",
     "ContentAddressedStore",
     "SQLiteEventStore",
     "StoreError",
@@ -105,6 +122,11 @@ __all__: list[str] = [
     "WhitespaceTokenCounter",
     "compile_context",
     "compute_epoch",
+    "OMLXInferenceAdapter",
+    "OMLXInferencePolicy",
+    "OMLXInferenceRequest",
+    "OMLXInferenceResponse",
+    "OMLXKVCacheProvider",
     "Action",
     "ActionError",
     "BudgetError",
